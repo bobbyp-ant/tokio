@@ -250,6 +250,16 @@ mod bench {
         };
 
         std::thread::scope(|scope| {
+            // Shutdown (untimed): when this guard drops, it publishes one final
+            // pseudo-window with the shutdown flag set to release the workers;
+            // the scope joins them on exit. The guard is created before the
+            // spawn loop so it is armed on every exit path: whether `f`
+            // returns, `f` panics, or a `scope.spawn` call below panics
+            // partway through spawning, already-running workers are released
+            // instead of leaving the scope join hanging on workers that never
+            // stop spinning.
+            let _shutdown = PoolShutdownGuard { shared: &shared };
+
             for worker in 0..n_workers {
                 let shared = &shared;
                 scope.spawn(move || {
@@ -286,13 +296,6 @@ mod bench {
                     }
                 });
             }
-
-            // Shutdown (untimed): when this guard drops, it publishes one final
-            // pseudo-window with the shutdown flag set to release the workers;
-            // the scope joins them on exit. The guard drops whether `f` returns
-            // or panics, so a dispatcher panic propagates as a panic rather
-            // than hanging the scope join on workers that never stop spinning.
-            let _shutdown = PoolShutdownGuard { shared: &shared };
 
             f(&PoolHandle { shared: &shared })
         })
