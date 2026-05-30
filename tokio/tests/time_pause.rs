@@ -491,12 +491,16 @@ fn auto_advance_guard_targets_originating_runtime() {
     th.join().unwrap();
 }
 
-/// Guard inhibits and blocking-task inhibits are tracked independently: dropping the
-/// guard while a blocking task is still running does not allow auto-advance, and the
-/// blocking task completing while a guard is held does not allow it either.
+/// Runs a paused runtime with two independent auto-advance inhibits in place: an
+/// `AutoAdvanceGuard` dropped from another thread after `guard_drop_after` of real
+/// time, and a `spawn_blocking` task that runs for `blocking_runs_for` of real time.
+/// Returns the wall-clock time at which a long virtual-time `sleep` completed; the
+/// sleep can only complete once BOTH inhibits are released.
 #[cfg(feature = "test-util")]
-#[test]
-fn auto_advance_guard_independent_of_blocking_inhibit() {
+fn sleep_elapsed_with_inhibits(
+    guard_drop_after: Duration,
+    blocking_runs_for: Duration,
+) -> Duration {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
@@ -511,31 +515,109 @@ fn auto_advance_guard_independent_of_blocking_inhibit() {
     let wall_start = std::time::Instant::now();
 
     rt.block_on(async {
-        // The blocking task finishes at ~100ms of real time; its inhibit is then
-        // released. The guard is still held, so auto-advance stays off until the
-        // guard drops at ~200ms.
-        let blocking = tokio::task::spawn_blocking(|| {
-            std::thread::sleep(Duration::from_millis(100));
+        let blocking = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(blocking_runs_for);
         });
 
         let th = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(guard_drop_after);
             drop(guard);
         });
 
-        // Completes only after BOTH the blocking task finished and the guard dropped.
+        // Completes only after every inhibit (guard and blocking task) is released.
         time::sleep(Duration::from_secs(15)).await;
+
+        // Capture the sleep's completion time before joining the helpers below, so
+        // that their own wall-clock completion times cannot mask when the sleep
+        // actually fired.
+        let elapsed = wall_start.elapsed();
 
         blocking.await.unwrap();
         th.join().unwrap();
-    });
 
-    let elapsed = wall_start.elapsed();
+        elapsed
+    })
+}
+
+/// Guard inhibits and blocking-task inhibits are tracked independently: the blocking
+/// task finishing while a guard is still held does not allow auto-advance; the sleep
+/// completes only once the guard also drops.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_guard_independent_of_blocking_inhibit() {
+    // The blocking task finishes first (~100ms); the guard (dropped at ~200ms) must
+    // keep auto-advance inhibited on its own.
+    let elapsed = sleep_elapsed_with_inhibits(
+        Duration::from_millis(200), // guard_drop_after
+        Duration::from_millis(100), // blocking_runs_for
+    );
+
     assert!(
         elapsed >= Duration::from_millis(200),
         "elapsed: {elapsed:?}"
     );
     assert!(elapsed < Duration::from_secs(10), "elapsed: {elapsed:?}");
+}
+
+/// The reverse ordering of `auto_advance_guard_independent_of_blocking_inhibit`:
+/// dropping the guard while a blocking task is still running does not allow
+/// auto-advance; the sleep completes only once the blocking task also finishes.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_blocking_inhibit_independent_of_guard() {
+    // The guard drops first (~100ms); the still-running blocking task (finishing at
+    // ~200ms) must keep auto-advance inhibited on its own.
+    let elapsed = sleep_elapsed_with_inhibits(
+        Duration::from_millis(100), // guard_drop_after
+        Duration::from_millis(200), // blocking_runs_for
+    );
+
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "elapsed: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(10), "elapsed: {elapsed:?}");
+}
+
+/// An `AutoAdvanceGuard` may outlive the runtime it was created on: the guard holds
+/// a runtime handle that keeps the driver alive, so dropping the guard after the
+/// runtime has been dropped must not panic.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_guard_outlives_dropped_runtime() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let guard = {
+        let _enter = rt.enter();
+        time::inhibit_auto_advance()
+    };
+
+    drop(rt);
+    drop(guard);
+}
+
+/// Like `auto_advance_guard_outlives_dropped_runtime`, but the runtime is shut down
+/// with `shutdown_background()` instead of dropped.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_guard_outlives_shutdown_background_runtime() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let guard = {
+        let _enter = rt.enter();
+        time::inhibit_auto_advance()
+    };
+
+    rt.shutdown_background();
+    drop(guard);
 }
 
 /// `inhibit_auto_advance()` outside any runtime context panics.
