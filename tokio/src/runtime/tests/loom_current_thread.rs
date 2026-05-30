@@ -230,3 +230,126 @@ fn auto_advance_guard_drop_vs_park() {
         th.join().unwrap();
     });
 }
+
+#[test]
+fn quiesce_vs_cross_thread_schedule() {
+    use crate::runtime::tests::loom_oneshot;
+
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+
+        let (tx, rx) = loom_oneshot::channel();
+
+        // Remote thread: spawns a task onto the runtime (inject queue + unpark),
+        // racing with the drain-park's resolution decision below.
+        let th = loom::thread::spawn(move || {
+            handle.spawn(async move {
+                tx.send(());
+            });
+        });
+
+        // Step 1: races with the remote spawn. May resolve before or after the
+        // injected task lands; either is correct.
+        let _ = rt.block_on(crate::time::quiesce());
+
+        // After join, the spawn has definitely been pushed.
+        th.join().unwrap();
+
+        // Step 2: the injected task (if it has not already run) must run before this
+        // unbounded quiesce resolves: the scheduler drains the inject queue before
+        // parking, and the drain-park hook re-checks it before resolving waiters.
+        let _ = rt.block_on(crate::time::quiesce());
+
+        // Proves the task ran in some step (was never dropped/lost). If the runtime
+        // lost the cross-thread spawn entirely, this recv never completes and loom
+        // reports a deadlock.
+        let () = rx.recv();
+    });
+}
+
+#[test]
+fn quiesce_guard_drop_vs_park() {
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (guard, bound) = {
+            let _enter = rt.handle().enter();
+            let guard = crate::time::inhibit_auto_advance();
+            let bound = crate::time::Instant::now() + Duration::from_millis(1);
+            (guard, bound)
+        };
+
+        // A timer exactly at the bound: the step can only complete after the guard
+        // drops (auto-advance is needed to fire it).
+        {
+            let _enter = rt.handle().enter();
+            rt.handle().spawn(async {
+                crate::time::sleep(Duration::from_millis(1)).await;
+            });
+        }
+
+        // Guard dropped from another thread, racing the runtime's park.
+        let th = loom::thread::spawn(move || {
+            drop(guard);
+        });
+
+        // Must complete under every interleaving (a missed unpark or a resolution
+        // that ignores the pending timer shows up as a loom deadlock or a panic).
+        let state = rt.block_on(crate::time::quiesce_until(bound));
+
+        // The timer fired before resolution.
+        assert!(state.next_timer.is_none());
+
+        th.join().unwrap();
+    });
+}
+
+#[test]
+fn quiesce_both_waiter_shapes() {
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let bound = {
+            let _enter = rt.handle().enter();
+            crate::time::Instant::now() + Duration::from_millis(2)
+        };
+
+        // A timer at 1ms (inside both bounds).
+        {
+            let _enter = rt.handle().enter();
+            rt.handle().spawn(async {
+                crate::time::sleep(Duration::from_millis(1)).await;
+            });
+        }
+
+        // Spawned-task waiter.
+        let waiter_jh = {
+            let _enter = rt.handle().enter();
+            rt.handle()
+                .spawn(async move { crate::time::quiesce_until(bound).await })
+        };
+
+        // Root-future waiter: block_on the spawned waiter's JoinHandle; the root
+        // future itself then awaits a quiesce as well.
+        let spawned_report = rt.block_on(waiter_jh).unwrap();
+        let root_report = rt.block_on(crate::time::quiesce_until(bound));
+
+        // Both shapes saw the timer fire and the same final clock position.
+        assert_eq!(spawned_report.now, root_report.now);
+        assert!(spawned_report.next_timer.is_none());
+        assert!(root_report.next_timer.is_none());
+    });
+}
