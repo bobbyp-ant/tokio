@@ -187,6 +187,24 @@ mod bench {
         }
     }
 
+    /// Releases the pool workers when dropped: sets the shutdown flag and
+    /// publishes one final pseudo-window so workers exit their spin loop.
+    ///
+    /// Shutdown lives in a `Drop` impl so it also runs if the dispatcher's
+    /// closure panics; otherwise the enclosing `std::thread::scope` would try
+    /// to join workers still spinning on `window_seq`, turning the panic into
+    /// a hang.
+    struct PoolShutdownGuard<'a> {
+        shared: &'a PoolShared,
+    }
+
+    impl Drop for PoolShutdownGuard<'_> {
+        fn drop(&mut self) {
+            self.shared.shutdown.store(true, Relaxed);
+            self.shared.window_seq.fetch_add(1, Release);
+        }
+    }
+
     /// Dispatcher-side handle to a running worker pool.
     struct PoolHandle<'a> {
         shared: &'a PoolShared,
@@ -269,15 +287,14 @@ mod bench {
                 });
             }
 
-            let result = f(&PoolHandle { shared: &shared });
+            // Shutdown (untimed): when this guard drops, it publishes one final
+            // pseudo-window with the shutdown flag set to release the workers;
+            // the scope joins them on exit. The guard drops whether `f` returns
+            // or panics, so a dispatcher panic propagates as a panic rather
+            // than hanging the scope join on workers that never stop spinning.
+            let _shutdown = PoolShutdownGuard { shared: &shared };
 
-            // Shutdown (untimed): publish one final pseudo-window with the
-            // shutdown flag set to release the workers; the scope joins them on
-            // exit.
-            shared.shutdown.store(true, Relaxed);
-            shared.window_seq.fetch_add(1, Release);
-
-            result
+            f(&PoolHandle { shared: &shared })
         })
     }
 
@@ -353,6 +370,45 @@ mod bench {
             .sum()
     }
 
+    /// Measures `iters` iterations of one working-world configuration; the
+    /// `iter_custom` body shared by the scaling and lookahead-sensitivity
+    /// groups. Each iteration builds a fresh world and worker pool (untimed),
+    /// times only the windowed simulation, and asserts at teardown that the
+    /// ring was live.
+    fn measure_working_world(
+        islands: usize,
+        threads: usize,
+        lookahead: Duration,
+        iters: u64,
+    ) -> Duration {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            // World construction: NOT timed.
+            let world: Vec<Island> = (0..islands)
+                .map(|id| build_island(id, true, VIRTUAL_HORIZON))
+                .collect();
+
+            // Pool creation/teardown: NOT timed (happens outside the closure
+            // passed to the pool).
+            total += with_worker_pool(&world, threads, |pool| {
+                // The simulation: timed.
+                let t0 = std::time::Instant::now();
+                let windows = run_world(&world, pool, lookahead, VIRTUAL_HORIZON);
+                let elapsed = t0.elapsed();
+                black_box(windows);
+                elapsed
+            });
+
+            // Teardown sanity (not timed): the ring was live.
+            assert!(
+                total_received(&world) > 0,
+                "no ring messages were delivered"
+            );
+            drop(world);
+        }
+        total
+    }
+
     fn bench_scaling(c: &mut Criterion) {
         let spin_cost = measure_spin_cost();
         println!(
@@ -373,33 +429,7 @@ mod bench {
                         &threads,
                         |b, &threads| {
                             b.iter_custom(|iters| {
-                                let mut total = Duration::ZERO;
-                                for _ in 0..iters {
-                                    // World construction: NOT timed.
-                                    let world: Vec<Island> = (0..islands)
-                                        .map(|id| build_island(id, true, VIRTUAL_HORIZON))
-                                        .collect();
-
-                                    // Pool creation/teardown: NOT timed (happens
-                                    // outside the closure passed to the pool).
-                                    total += with_worker_pool(&world, threads, |pool| {
-                                        // The simulation: timed.
-                                        let t0 = std::time::Instant::now();
-                                        let windows =
-                                            run_world(&world, pool, lookahead, VIRTUAL_HORIZON);
-                                        let elapsed = t0.elapsed();
-                                        black_box(windows);
-                                        elapsed
-                                    });
-
-                                    // Teardown sanity (not timed): the ring was live.
-                                    assert!(
-                                        total_received(&world) > 0,
-                                        "no ring messages were delivered"
-                                    );
-                                    drop(world);
-                                }
-                                total
+                                measure_working_world(islands, threads, lookahead, iters)
                             });
                         },
                     );
@@ -432,32 +462,7 @@ mod bench {
                     &threads,
                     |b, &threads| {
                         b.iter_custom(|iters| {
-                            let mut total = Duration::ZERO;
-                            for _ in 0..iters {
-                                // World construction: NOT timed.
-                                let world: Vec<Island> = (0..islands)
-                                    .map(|id| build_island(id, true, VIRTUAL_HORIZON))
-                                    .collect();
-
-                                // Pool creation/teardown: NOT timed.
-                                total += with_worker_pool(&world, threads, |pool| {
-                                    // The simulation: timed.
-                                    let t0 = std::time::Instant::now();
-                                    let windows =
-                                        run_world(&world, pool, lookahead, VIRTUAL_HORIZON);
-                                    let elapsed = t0.elapsed();
-                                    black_box(windows);
-                                    elapsed
-                                });
-
-                                // Teardown sanity (not timed): the ring was live.
-                                assert!(
-                                    total_received(&world) > 0,
-                                    "no ring messages were delivered"
-                                );
-                                drop(world);
-                            }
-                            total
+                            measure_working_world(islands, threads, lookahead, iters)
                         });
                     },
                 );
