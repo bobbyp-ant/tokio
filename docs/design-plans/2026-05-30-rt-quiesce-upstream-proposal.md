@@ -494,4 +494,9 @@ Files:
 5. The upstream PRs are assembled fresh from the file lists and descriptions above. The
    proposing repository's own development history — including its planning documents and
    the commits that touch them — stays local and is not pushed as any part of the upstream
-   series.
+   series. Files appearing in both PR1's and PR2's lists (`clock.rs`, `time/mod.rs`,
+   `loom_current_thread.rs`, `spellcheck.dic`) carry an intermediate state in PR1: the
+   quiesce-waiter panic integration and all doc cross-references to quiesce items must be
+   excluded from PR1's copies, since those symbols do not exist until PR2. Run the full
+   local CI equivalent (build, rustdoc with warnings denied, spellcheck) on the assembled
+   PR1 tree, since that intermediate state never existed in this repository's history.
