@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::Duration;
 
 fn assert_at_most_num_polls(rt: Arc<Runtime>, at_most_polls: usize) {
     let (tx, rx) = oneshot::channel();
@@ -195,4 +196,37 @@ impl Future for ResetFuture {
             _ => Poll::Ready(()),
         }
     }
+}
+
+#[test]
+fn auto_advance_guard_drop_vs_park() {
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let guard = {
+            let _enter = rt.handle().enter();
+            crate::time::inhibit_auto_advance()
+        };
+
+        // Drop the guard from another thread. This races with the runtime parking in
+        // block_on below: the runtime may park before, during, or after the
+        // release+unpark. Under every interleaving the runtime must observe the
+        // release and auto-advance the sleep — if the unpark were missing, loom
+        // would report a deadlock (all threads blocked).
+        let th = loom::thread::spawn(move || {
+            drop(guard);
+        });
+
+        // The sleep is constructed inside the async block because creating a `Sleep`
+        // requires a runtime context, which `block_on`'s argument position lacks.
+        rt.block_on(async {
+            crate::time::sleep(Duration::from_millis(1)).await;
+        });
+
+        th.join().unwrap();
+    });
 }
