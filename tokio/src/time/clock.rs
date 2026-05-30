@@ -49,6 +49,25 @@ cfg_test_util! {
                 Err(msg) => panic!("{}", msg),
             }
         }
+
+        /// Panics if any quiesce waiter is registered on the current runtime's time
+        /// driver. `resume()` and `advance()` are mutually exclusive with an
+        /// in-progress `quiesce()` step: both would move the clock out from under the
+        /// step and break its reproducibility contract.
+        #[track_caller]
+        fn panic_if_quiesce_waiters(api: &str) {
+            use crate::runtime::Handle;
+
+            if let Ok(handle) = Handle::try_current() {
+                if let Some(time_handle) = handle.inner.driver().time.as_ref() {
+                    if time_handle.has_quiesce_waiters() {
+                        panic!(
+                            "`time::{api}()` cannot be called while a `quiesce()` is in progress"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     cfg_not_rt! {
@@ -182,6 +201,7 @@ cfg_test_util! {
     /// runtime.
     #[track_caller]
     pub fn resume() {
+        panic_if_quiesce_waiters("resume");
         with_clock(|maybe_clock| {
             let clock = match maybe_clock {
                 Some(clock) => clock,
@@ -272,6 +292,7 @@ cfg_test_util! {
     ///
     /// [`sleep`]: fn@crate::time::sleep
     pub async fn advance(duration: Duration) {
+        panic_if_quiesce_waiters("advance");
         with_clock(|maybe_clock| {
             let clock = match maybe_clock {
                 Some(clock) => clock,

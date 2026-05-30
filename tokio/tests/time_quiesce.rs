@@ -346,3 +346,49 @@ async fn quiesce_unpaused_clock_panics() {
 async fn quiesce_multi_thread_panics() {
     let _ = time::quiesce().await;
 }
+
+/// `advance()` while a quiesce step is registered panics: an explicit advance would
+/// move the clock past the step's bound and break reproducibility.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "cannot be called while a `quiesce()` is in progress")]
+async fn advance_during_quiesce_panics() {
+    let start = Instant::now();
+
+    // A spawned task holds an unbounded quiesce open (never resolves: the timer
+    // below keeps the wheel non-empty).
+    tokio::spawn(async {
+        let _ = time::quiesce().await;
+    });
+    // A pending timer so the quiesce waiter cannot resolve.
+    tokio::spawn(async move {
+        time::sleep_until(start + Duration::from_millis(100)).await;
+    });
+
+    // Let the spawned tasks run (and the waiter register) by yielding a few times.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    time::advance(Duration::from_millis(10)).await;
+}
+
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "cannot be called while a `quiesce()` is in progress")]
+async fn resume_during_quiesce_panics() {
+    let start = Instant::now();
+
+    tokio::spawn(async {
+        let _ = time::quiesce().await;
+    });
+    tokio::spawn(async move {
+        time::sleep_until(start + Duration::from_millis(100)).await;
+    });
+
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    time::resume();
+}
