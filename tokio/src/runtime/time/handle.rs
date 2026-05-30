@@ -7,7 +7,7 @@ pub(crate) struct Handle {
     pub(super) inner: super::Inner,
 
     /// Number of registered (uncollected) quiesce waiters. Lock-free fast path for
-    /// the current_thread scheduler's drain-park hook: when zero, the hook does
+    /// the `current_thread` scheduler's drain-park hook: when zero, the hook does
     /// nothing beyond this single load.
     #[cfg(feature = "test-util")]
     pub(super) quiesce_waiter_count: crate::loom::sync::atomic::AtomicUsize,
@@ -20,7 +20,7 @@ impl Handle {
     }
 
     /// Checks whether the driver has been shutdown.
-    pub(super) fn is_shutdown(&self) -> bool {
+    pub(crate) fn is_shutdown(&self) -> bool {
         self.inner.is_shutdown()
     }
 

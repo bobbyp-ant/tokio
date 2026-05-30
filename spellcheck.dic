@@ -1,4 +1,4 @@
-316
+319
 &
 +
 <
@@ -209,6 +209,8 @@ poller
 POSIX
 proxied
 qos
+quiesce
+quiesced
 RAII
 RCU
 reallocations
@@ -224,6 +226,7 @@ reregistering
 resize
 resized
 RMW
+runnable
 runtime
 runtime's
 runtimes

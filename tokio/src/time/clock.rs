@@ -496,6 +496,12 @@ cfg_test_util! {
             inner.blocking_inhibit_count > 0
         }
 
+        /// Returns true if the clock is currently paused (frozen).
+        pub(crate) fn is_paused(&self) -> bool {
+            let inner = self.inner.lock();
+            inner.unfrozen.is_none()
+        }
+
         pub(crate) fn advance(&self, duration: Duration) -> Result<(), &'static str> {
             let mut inner = self.inner.lock();
 
