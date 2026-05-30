@@ -331,3 +331,225 @@ fn poll_next(interval: &mut task::Spawn<time::Interval>) -> Poll<Instant> {
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
+
+/// While an `AutoAdvanceGuard` is held, a paused runtime cannot auto-advance, so a
+/// sleep waits in real time. Dropping the guard from another thread unparks the
+/// runtime promptly and lets auto-advance fire the sleep.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_guard_inhibits_and_drop_unparks() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let guard = {
+        let _enter = rt.enter();
+        time::inhibit_auto_advance()
+    };
+
+    let wall_start = std::time::Instant::now();
+
+    let th = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(guard);
+    });
+
+    // 15s of virtual time. With the guard held this cannot auto-advance; it can only
+    // complete after the guard drops at ~100ms of real time.
+    rt.block_on(async { time::sleep(Duration::from_secs(15)).await });
+
+    let elapsed = wall_start.elapsed();
+    // The guard was honored: the sleep did not complete before the drop.
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "elapsed: {elapsed:?}"
+    );
+    // The drop unparked the runtime promptly: we did not wait out the 15s in real time.
+    assert!(elapsed < Duration::from_secs(10), "elapsed: {elapsed:?}");
+    th.join().unwrap();
+}
+
+/// Auto-advance resumes only after the LAST guard drops.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_guards_are_counted() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let (g1, g2) = {
+        let _enter = rt.enter();
+        (time::inhibit_auto_advance(), time::inhibit_auto_advance())
+    };
+
+    let wall_start = std::time::Instant::now();
+
+    let th = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(g1);
+        std::thread::sleep(Duration::from_millis(100));
+        drop(g2);
+    });
+
+    rt.block_on(async { time::sleep(Duration::from_secs(15)).await });
+
+    let elapsed = wall_start.elapsed();
+    // If the first drop had released the inhibit (counting bug), the sleep would have
+    // completed at ~100ms.
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "elapsed: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(10), "elapsed: {elapsed:?}");
+    th.join().unwrap();
+}
+
+/// Holding a guard only disables AUTO-advance; explicit `advance()` still moves the
+/// clock.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn explicit_advance_works_while_guard_held() {
+    let _guard = time::inhibit_auto_advance();
+
+    let start = Instant::now();
+    time::advance(Duration::from_millis(100)).await;
+    assert_eq!(Instant::now() - start, Duration::from_millis(100));
+}
+
+/// A guard affects only the runtime it was created on. Dropping it while a different
+/// runtime's context is current releases the ORIGINATING runtime's inhibit; dropping
+/// a guard with no runtime context at all also works.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_guard_targets_originating_runtime() {
+    let rt_a = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let rt_b = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let guard_a = {
+        let _enter = rt_a.enter();
+        time::inhibit_auto_advance()
+    };
+    let guard_b = {
+        let _enter = rt_b.enter();
+        time::inhibit_auto_advance()
+    };
+
+    let handle_b = rt_b.handle().clone();
+    let wall_start = std::time::Instant::now();
+
+    let th = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            // Drop A's guard while B's context is current on this thread. This must
+            // release A's inhibit (not B's).
+            let _enter_b = handle_b.enter();
+            drop(guard_a);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        // Drop B's guard with no runtime context current at all.
+        drop(guard_b);
+    });
+
+    // A unblocks at ~100ms: guard_a's drop released A even though B's context was
+    // current at drop time.
+    rt_a.block_on(async { time::sleep(Duration::from_secs(15)).await });
+    let elapsed_a = wall_start.elapsed();
+    assert!(
+        elapsed_a >= Duration::from_millis(100),
+        "elapsed_a: {elapsed_a:?}"
+    );
+    assert!(
+        elapsed_a < Duration::from_secs(10),
+        "elapsed_a: {elapsed_a:?}"
+    );
+
+    // B unblocks only at ~200ms: guard_a's drop did NOT release B's inhibit even
+    // though B's context was current; only guard_b's own drop did.
+    rt_b.block_on(async { time::sleep(Duration::from_secs(15)).await });
+    let elapsed_b = wall_start.elapsed();
+    assert!(
+        elapsed_b >= Duration::from_millis(200),
+        "elapsed_b: {elapsed_b:?}"
+    );
+    assert!(
+        elapsed_b < Duration::from_secs(20),
+        "elapsed_b: {elapsed_b:?}"
+    );
+
+    th.join().unwrap();
+}
+
+/// Guard inhibits and blocking-task inhibits are tracked independently: dropping the
+/// guard while a blocking task is still running does not allow auto-advance, and the
+/// blocking task completing while a guard is held does not allow it either.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_advance_guard_independent_of_blocking_inhibit() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let guard = {
+        let _enter = rt.enter();
+        time::inhibit_auto_advance()
+    };
+
+    let wall_start = std::time::Instant::now();
+
+    rt.block_on(async {
+        // The blocking task finishes at ~100ms of real time; its inhibit is then
+        // released. The guard is still held, so auto-advance stays off until the
+        // guard drops at ~200ms.
+        let blocking = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let th = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(guard);
+        });
+
+        // Completes only after BOTH the blocking task finished and the guard dropped.
+        time::sleep(Duration::from_secs(15)).await;
+
+        blocking.await.unwrap();
+        th.join().unwrap();
+    });
+
+    let elapsed = wall_start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "elapsed: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(10), "elapsed: {elapsed:?}");
+}
+
+/// `inhibit_auto_advance()` outside any runtime context panics.
+#[cfg(feature = "test-util")]
+#[test]
+#[should_panic(expected = "auto-advance cannot be inhibited from outside the Tokio runtime")]
+fn inhibit_auto_advance_outside_runtime_panics() {
+    let _guard = time::inhibit_auto_advance();
+}
+
+/// `inhibit_auto_advance()` on the multi-thread flavor panics.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[should_panic(expected = "requires the `current_thread` Tokio runtime")]
+async fn inhibit_auto_advance_multi_thread_panics() {
+    let _guard = time::inhibit_auto_advance();
+}

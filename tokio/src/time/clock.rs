@@ -299,6 +299,118 @@ cfg_test_util! {
         })
     }
 
+    /// An RAII guard that prevents the paused clock from auto-advancing while it is
+    /// alive.
+    ///
+    /// Returned by [`inhibit_auto_advance`]. Dropping the guard re-enables
+    /// auto-advance — once no other guards and no outstanding [`spawn_blocking`]
+    /// tasks inhibit it — and unparks the runtime the guard was created on, so a
+    /// parked runtime notices the release promptly.
+    ///
+    /// The guard always affects the runtime it was created on, regardless of which
+    /// runtime context (if any) is current when it is dropped.
+    ///
+    /// # Caution
+    ///
+    /// Holding a guard on the same thread that then blocks the runtime on a future
+    /// that can only complete via auto-advance (for example, a `sleep` on a paused
+    /// runtime with no other pending work) waits in real time until the guard is
+    /// dropped from another thread. Hold and drop guards from outside the runtime,
+    /// or from tasks that are woken by external events.
+    ///
+    /// [`spawn_blocking`]: crate::task::spawn_blocking
+    #[derive(Debug)]
+    #[must_use = "auto-advance is re-enabled when the guard is dropped"]
+    pub struct AutoAdvanceGuard {
+        handle: crate::runtime::Handle,
+    }
+
+    impl Drop for AutoAdvanceGuard {
+        fn drop(&mut self) {
+            use crate::runtime::scheduler;
+
+            match &self.handle.inner {
+                scheduler::Handle::CurrentThread(handle) => {
+                    handle.driver.clock.allow_auto_advance_user();
+                    handle.driver.unpark();
+                }
+                // `inhibit_auto_advance()` panics on the multi-thread flavor, so a
+                // guard can never hold a multi-thread handle. Do nothing rather than
+                // risk panicking in drop.
+                #[cfg(feature = "rt-multi-thread")]
+                scheduler::Handle::MultiThread(_) => {}
+            }
+        }
+    }
+
+    /// Prevents the clock from auto-advancing while the returned guard is held.
+    ///
+    /// When the runtime's clock is [paused](pause) and the runtime has no work left
+    /// to do, the clock normally "auto-advances" to the next pending timer so that
+    /// timers fire without waiting in real time. While any [`AutoAdvanceGuard`] is
+    /// alive, that auto-advance is disabled: timers fire only if the clock is moved
+    /// explicitly with [`advance`], or after every guard has been dropped.
+    ///
+    /// Guards are counted: auto-advance stays disabled until the last guard drops.
+    ///
+    /// This is useful when a test needs virtual time to stand still while something
+    /// outside the runtime (real I/O, another thread, an external process) catches
+    /// up.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime context, or on a runtime whose
+    /// flavor is not `current_thread` (auto-advance, like [`pause`], only exists on
+    /// the `current_thread` flavor).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::time::{self, Duration, Instant};
+    ///
+    /// #[tokio::main(flavor = "current_thread", start_paused = true)]
+    /// async fn main() {
+    ///     let guard = time::inhibit_auto_advance();
+    ///
+    ///     // While the guard is held, the clock only moves when advanced explicitly.
+    ///     let start = Instant::now();
+    ///     time::advance(Duration::from_millis(100)).await;
+    ///     assert_eq!(Instant::now() - start, Duration::from_millis(100));
+    ///
+    ///     drop(guard);
+    ///
+    ///     // Auto-advance is enabled again: this sleep completes by advancing the
+    ///     // paused clock instead of waiting in real time.
+    ///     time::sleep(Duration::from_secs(1)).await;
+    /// }
+    /// ```
+    #[track_caller]
+    pub fn inhibit_auto_advance() -> AutoAdvanceGuard {
+        use crate::runtime::scheduler;
+        use crate::runtime::Handle;
+
+        let handle = match Handle::try_current() {
+            Ok(handle) => handle,
+            Err(ref e) if e.is_missing_context() => {
+                panic!("auto-advance cannot be inhibited from outside the Tokio runtime")
+            }
+            Err(_) => panic!("{}", crate::util::error::THREAD_LOCAL_DESTROYED_ERROR),
+        };
+
+        match &handle.inner {
+            scheduler::Handle::CurrentThread(current_thread) => {
+                current_thread.driver.clock.inhibit_auto_advance_user();
+            }
+            #[cfg(feature = "rt-multi-thread")]
+            scheduler::Handle::MultiThread(_) => panic!(
+                "`time::inhibit_auto_advance()` requires the `current_thread` Tokio runtime. \
+                 This is the default Runtime used by `#[tokio::test]."
+            ),
+        }
+
+        AutoAdvanceGuard { handle }
+    }
+
     impl Clock {
         /// Returns a new `Clock` instance that uses the current execution context's
         /// source of time.
@@ -359,13 +471,11 @@ cfg_test_util! {
 
         /// Temporarily stop auto-advancing the clock on behalf of a user-held
         /// `AutoAdvanceGuard`.
-        #[allow(dead_code)]
         pub(crate) fn inhibit_auto_advance_user(&self) {
             let mut inner = self.inner.lock();
             inner.user_inhibit_count += 1;
         }
 
-        #[allow(dead_code)]
         pub(crate) fn allow_auto_advance_user(&self) {
             let mut inner = self.inner.lock();
             inner.user_inhibit_count -= 1;
