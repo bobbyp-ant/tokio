@@ -328,10 +328,10 @@ impl Quiesce {
     /// scheduler handle.
     #[track_caller]
     fn register(bound: Option<Instant>, waker: &task::Waker) -> (u64, scheduler::Handle) {
-        // Panics with CONTEXT_MISSING_ERROR outside a runtime context (AC3.3).
+        // Panics with CONTEXT_MISSING_ERROR outside a runtime context.
         let handle = scheduler::Handle::current();
 
-        // Flavor check: quiesce only exists for the current_thread flavor (AC3.1).
+        // Flavor check: quiesce only exists for the current_thread flavor.
         // LocalRuntime also uses the CurrentThread scheduler handle, so it passes.
         match &handle {
             scheduler::Handle::CurrentThread(_) => {}
@@ -342,11 +342,11 @@ impl Quiesce {
             ),
         }
 
-        // Time-driver presence check (AC3.4): panics with the existing
+        // Time-driver presence check: panics with the existing
         // "timers are disabled" message.
         let time_handle = handle.driver().time();
 
-        // Paused-clock check (AC3.2).
+        // Paused-clock check.
         let clock = handle.driver().clock();
         if !clock.is_paused() {
             panic!(

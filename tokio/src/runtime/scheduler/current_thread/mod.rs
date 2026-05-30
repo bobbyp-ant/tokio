@@ -550,7 +550,7 @@ impl Context {
         driver: &mut Driver,
     ) -> (Box<Core>, bool) {
         // Fast path: no waiter registered (and no time driver means no waiters can
-        // exist). One relaxed atomic load, no locks. (rt-quiesce.AC5.2)
+        // exist). One relaxed atomic load, no locks.
         let has_waiters = match &handle.driver.time {
             Some(time_handle) => time_handle.has_quiesce_waiters(),
             None => false,
