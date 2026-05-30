@@ -101,5 +101,10 @@ name = "spawn_blocking"
 path = "spawn_blocking.rs"
 harness = false
 
+[[bench]]
+name = "rt_quiesce"
+path = "rt_quiesce.rs"
+harness = false
+
 [lints]
 workspace = true
