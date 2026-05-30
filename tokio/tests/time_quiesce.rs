@@ -332,6 +332,128 @@ async fn quiesce_awaited_in_spawned_task() {
     assert_eq!(state.next_timer, None);
 }
 
+// ===== Drain-park hook re-check coverage =====
+//
+// The tests in this section exercise the scheduler hook's runnable-work re-check:
+// work that becomes visible only at the drain park (IO readiness, cross-thread
+// wakes, outstanding blocking tasks). The hook's zero-timeout driver poll consumes
+// any pending wakeup, so discovering work there and parking anyway would hang the
+// runtime forever.
+
+/// IO readiness that arrives between the scheduler's last driver poll and the
+/// drain park is surfaced by the hook's zero-timeout poll. The woken task must run
+/// (the park must be skipped) instead of the runtime parking on a wakeup that the
+/// poll just consumed.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn quiesce_io_readiness_discovered_at_drain_park() {
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    let (mut server, _) = listener.accept().await.unwrap();
+
+    let read_task = tokio::spawn(async move {
+        let mut buf = [0u8; 5];
+        server.read_exact(&mut buf).await.unwrap();
+        buf
+    });
+    // Let the read task register IO interest.
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    // Readiness arrives between the last driver poll and the drain park.
+    client.write_all(b"hello").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Unbounded quiesce on an empty wheel: must NOT hang.
+    let state = time::quiesce().await;
+    assert!(state.next_timer.is_none());
+    assert_eq!(&read_task.await.unwrap(), b"hello");
+}
+
+/// An outstanding `spawn_blocking` task inhibits quiesce resolution: the hook's
+/// blocking-inhibit branch parks the runtime, and the blocking task's completion
+/// (which releases the inhibit and then unparks the driver) lets the quiesce
+/// resolve afterwards.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn quiesce_waits_for_outstanding_blocking_task() {
+    use std::sync::atomic::AtomicBool;
+
+    let done = Arc::new(AtomicBool::new(false));
+
+    let blocking = {
+        let done = done.clone();
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            done.store(true, SeqCst);
+        })
+    };
+
+    // Unbounded quiesce: must not resolve while the blocking task is outstanding
+    // (outstanding blocking work implies future wakes).
+    let state = time::quiesce().await;
+
+    // The store happens before the blocking task completes, which happens before
+    // the inhibit release that allows the quiesce to resolve.
+    assert!(
+        done.load(SeqCst),
+        "quiesce resolved while a blocking task was still outstanding"
+    );
+    assert!(state.next_timer.is_none());
+    blocking.await.unwrap();
+}
+
+/// A cross-thread wake (a foreign thread completing a oneshot a spawned task is
+/// awaiting) that lands during a quiesce step must run the woken task before the
+/// quiesce resolves, and must never strand the runtime in a park whose wakeup was
+/// already consumed.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn quiesce_cross_thread_wake_during_step() {
+    use std::sync::atomic::AtomicBool;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+    let received = Arc::new(AtomicBool::new(false));
+
+    let task = {
+        let received = received.clone();
+        tokio::spawn(async move {
+            let value = rx.await.unwrap();
+            received.store(true, SeqCst);
+            value
+        })
+    };
+
+    // Let the task register with the channel.
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+
+    // The blocking-pool thread is a foreign thread: the send wakes the channel task
+    // through the cross-thread schedule path (inject queue push + driver unpark).
+    // The send happens before the blocking task completes, so the quiesce (which
+    // cannot resolve until the blocking task's inhibit is released) is still in
+    // progress when the wake lands.
+    let blocking = tokio::task::spawn_blocking(move || {
+        tx.send(42).unwrap();
+    });
+
+    let state = time::quiesce().await;
+
+    // The cross-thread woken task ran to completion before the quiesce resolved.
+    assert!(
+        received.load(SeqCst),
+        "quiesce resolved before the cross-thread woken task ran"
+    );
+    assert!(state.next_timer.is_none());
+    assert_eq!(task.await.unwrap(), 42);
+    blocking.await.unwrap();
+}
+
 #[cfg(feature = "test-util")]
 #[tokio::test]
 #[should_panic(expected = "requires the runtime's clock to be paused")]
