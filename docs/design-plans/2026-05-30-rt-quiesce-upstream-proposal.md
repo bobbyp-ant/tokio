@@ -107,12 +107,12 @@ The maintainer position on record is one sentence, from Darksonn in July 2022:
 
 > If someone wants to write a PR, then I am ok with adding this.
 
-That is the entire sign-off that exists — one sentence, minimal and unconditional, from
-2022. Three PRs have attempted the feature since, and none merged: #4523 (2022) was closed
-as stale, #5200 (2022) was closed as a duplicate, and #6113 (2023) is still open but has
-been stalled since October 2024 on review questions. This proposal includes the feature
-(the `inhibit_auto_advance()` guard) as its first PR, and answers those review questions
-directly below.
+That is the entire statement: one sentence expressing openness to a PR, from 2022 — not a
+reviewed design, and not a commitment. Three PRs have attempted the feature since, and none
+merged: #4523 (2022) was closed as stale, #5200 (2022) was closed as a duplicate, and #6113
+(2023) is still open but has been stalled since October 2024 on review questions. This
+proposal includes the feature (the `inhibit_auto_advance()` guard) as its first PR, and
+answers those review questions directly below.
 
 #### Why not just disable time mocking entirely?
 
@@ -183,12 +183,11 @@ in one step and reports where it stopped.
 
 #### #1845: simulation infrastructure stays outside Tokio
 
-#1845 ("Consider exposing simulation's types in Tokio") was closed as not-planned: the
-historical signal that maintainers do not want simulation infrastructure inside Tokio. This
-proposal respects that boundary. The simulation harness — message exchange between islands,
-windowing, lookahead, GVT computation — stays outside Tokio, in user code. Tokio gains only
-a minimal observation and stepping control surface over its existing test-util clock, in
-the same spirit as `pause()` and `advance()`.
+#1845 ("Consider exposing simulation's types in Tokio") was closed as not-planned. This
+proposal does not ask Tokio to take simulation infrastructure in. The simulation harness —
+message exchange between islands, windowing, lookahead, GVT computation — stays outside
+Tokio, in user code. Tokio gains only a minimal observation and stepping control surface
+over its existing test-util clock, in the same spirit as `pause()` and `advance()`.
 
 ### Why not existing tools
 
@@ -492,3 +491,7 @@ Files:
    manually so its new model in the current-thread loom suite runs. PR2 picks up
    `R-loom-current-thread` and `R-loom-time-driver` automatically but needs
    `R-loom-blocking` added manually for its blocking-release model.
+5. The upstream PRs are assembled fresh from the file lists and descriptions above. The
+   proposing repository's own development history — including its planning documents and
+   the commits that touch them — stays local and is not pushed as any part of the upstream
+   series.
