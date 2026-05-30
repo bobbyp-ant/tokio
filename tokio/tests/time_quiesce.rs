@@ -644,6 +644,50 @@ fn quiesce_polled_after_shutdown_panics() {
     let _ = quiesce.as_mut().poll(&mut cx);
 }
 
+/// Driver shutdown drains the quiesce waiter registry; it must also reset the
+/// waiter count that backs the `resume()`/`advance()` mutual-exclusion check. A
+/// stale count would make those APIs, called through a still-live `Handle` of the
+/// shut-down runtime, panic with a misleading
+/// "cannot be called while a `quiesce()` is in progress" message.
+#[cfg(feature = "test-util")]
+#[test]
+fn shutdown_with_quiesce_waiter_does_not_poison_time_apis() {
+    use futures::task::noop_waker_ref;
+    use std::future::Future;
+    use std::task::Context;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let handle = rt.handle().clone();
+
+    let mut quiesce = Box::pin(time::quiesce());
+
+    // First poll registers the waiter with the runtime's time driver.
+    {
+        let _enter = rt.enter();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(quiesce.as_mut().poll(&mut cx).is_pending());
+    }
+
+    // Shut the runtime down with the waiter still registered: the driver drains
+    // the registry wholesale.
+    drop(rt);
+
+    // Dropping the orphaned future cannot affect the count: its registry entry is
+    // already gone, so deregistration is a no-op.
+    drop(quiesce);
+
+    // The shut-down runtime's time driver must not report phantom waiters.
+    // `resume()` consults the waiter count through the current context's handle;
+    // with a correctly reset count it proceeds (and succeeds, since the clock is
+    // still paused).
+    let _enter = handle.enter();
+    time::resume();
+}
+
 // ===== Interaction semantics (rt-quiesce.AC2) =====
 
 /// rt-quiesce.AC2.1: an outstanding `spawn_blocking` task defers quiesce resolution;

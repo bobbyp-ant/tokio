@@ -267,6 +267,13 @@ impl Driver {
         {
             let mut lock = handle.inner.lock();
             let waiters = std::mem::take(&mut lock.quiesce_waiters);
+            // The count mirrors the registry and is only mutated while holding the
+            // registry lock; reset it together with the drain. Orphaned `Quiesce`
+            // futures cannot do this themselves (their entries are already gone, so
+            // their deregistration is a no-op), and a stale count would make
+            // `resume()`/`advance()` through a still-live `Handle` report a phantom
+            // in-progress quiesce.
+            handle.quiesce_waiter_count.store(0, Ordering::Relaxed);
             drop(lock);
             for waiter in waiters {
                 waiter.waker.wake();
