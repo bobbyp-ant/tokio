@@ -147,8 +147,13 @@ cfg_test_util! {
     /// other timer-backed primitives can cause the runtime to advance the
     /// current time when awaited.
     ///
+    /// Auto-advance can be held off entirely by holding an [`AutoAdvanceGuard`]
+    /// (see [`inhibit_auto_advance`]), and a paused runtime can be stepped
+    /// through virtual time deterministically with [`quiesce_until`].
+    ///
     /// [`Sleep`]: crate::time::Sleep
     /// [`advance`]: crate::time::advance
+    /// [`quiesce_until`]: crate::time::quiesce_until
     #[track_caller]
     pub fn pause() {
         with_clock(|maybe_clock| {
@@ -166,8 +171,11 @@ cfg_test_util! {
     ///
     /// # Panics
     ///
-    /// Panics if time is not frozen or if called from outside of the Tokio
-    /// runtime.
+    /// Panics if time is not frozen, if called from outside of the Tokio
+    /// runtime, or if a [`quiesce`] step is in progress on this runtime
+    /// (quiescence stepping and a running wall clock are mutually exclusive).
+    ///
+    /// [`quiesce`]: crate::time::quiesce()
     #[track_caller]
     pub fn resume() {
         panic_if_quiesce_waiters("resume");
@@ -216,6 +224,9 @@ cfg_test_util! {
     /// - If called outside of the Tokio runtime.
     /// - If the input `duration` is too large (such as [`Duration::MAX`])
     ///   to be safely added to the current time without causing an overflow.
+    /// - If a [`quiesce`] step is in progress on this runtime. The two APIs are
+    ///   mutually exclusive: an explicit advance during a step would move the
+    ///   clock past the step's bound.
     ///
     /// # Caveats
     ///
@@ -229,6 +240,7 @@ cfg_test_util! {
     /// details.
     ///
     /// [`sleep`]: fn@crate::time::sleep
+    /// [`quiesce`]: crate::time::quiesce()
     pub async fn advance(duration: Duration) {
         panic_if_quiesce_waiters("advance");
         with_clock(|maybe_clock| {
@@ -269,15 +281,21 @@ cfg_test_util! {
     /// The guard always affects the runtime it was created on, regardless of which
     /// runtime context (if any) is current when it is dropped.
     ///
+    /// A held guard blocks auto-advance, not quiescence: it does not prevent
+    /// [`quiesce_until`] from resolving when no timer at or below that call's
+    /// bound is pending.
+    ///
     /// # Caution
     ///
     /// Holding a guard on the same thread that then blocks the runtime on a future
     /// that can only complete via auto-advance (for example, a `sleep` on a paused
-    /// runtime with no other pending work) waits in real time until the guard is
-    /// dropped from another thread. Hold and drop guards from outside the runtime,
-    /// or from tasks that are woken by external events.
+    /// runtime with no other pending work, or a [`quiesce_until`] with a timer at
+    /// or below its bound) waits in real time until the guard is dropped from
+    /// another thread. Hold and drop guards from outside the runtime, or from tasks
+    /// that are woken by external events.
     ///
     /// [`spawn_blocking`]: crate::task::spawn_blocking
+    /// [`quiesce_until`]: crate::time::quiesce_until
     #[derive(Debug)]
     #[must_use = "auto-advance is re-enabled when the guard is dropped"]
     pub struct AutoAdvanceGuard {
