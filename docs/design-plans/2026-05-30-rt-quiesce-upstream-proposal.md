@@ -495,8 +495,11 @@ Files:
    proposing repository's own development history — including its planning documents and
    the commits that touch them — stays local and is not pushed as any part of the upstream
    series. Files appearing in both PR1's and PR2's lists (`clock.rs`, `time/mod.rs`,
-   `loom_current_thread.rs`, `spellcheck.dic`) carry an intermediate state in PR1: the
-   quiesce-waiter panic integration and all doc cross-references to quiesce items must be
-   excluded from PR1's copies, since those symbols do not exist until PR2. Run the full
-   local CI equivalent (build, rustdoc with warnings denied, spellcheck) on the assembled
-   PR1 tree, since that intermediate state never existed in this repository's history.
+   `loom_current_thread.rs`, `spellcheck.dic`) carry an intermediate state in PR1:
+   everything referencing quiesce symbols — the quiesce-waiter panic integration and doc
+   cross-references in `clock.rs`, the quiesce module declaration and re-exports in
+   `time/mod.rs`, the `quiesce_*` loom models, and the quiesce-related dictionary entries —
+   must be excluded from PR1's copies, since those symbols do not exist until PR2. Run the
+   full local CI equivalent (build, rustdoc with warnings denied, spellcheck, and a
+   `--cfg loom` build of the current-thread loom suite) on the assembled PR1 tree, since
+   that intermediate state never existed in this repository's history.
