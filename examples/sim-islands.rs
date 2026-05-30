@@ -1,7 +1,7 @@
 //! Deterministic simulation of a small distributed system on paused Tokio runtimes.
 //!
 //! The simulated world has three kinds of "islands" — frontends, a single
-//! leader-elected orchestrator, and backends — each running inside its own paused
+//! orchestrator (island 0), and backends — each running inside its own paused
 //! `current_thread` runtime. An external controller steps every island in
 //! lookahead-sized virtual-time windows using `tokio::time::quiesce_until`
 //! (a conservative parallel-discrete-event-simulation loop), exchanging cross-island
@@ -342,8 +342,8 @@ async fn orchestrator(
             }
             Payload::Reply { request_id, from } => {
                 // The requesting frontend is encoded in the request id's upper bits.
-                let frontend = (request_id >> 32) as usize;
-                send_out(&outbox, start, frontend, Payload::Response { request_id });
+                let requester = (request_id >> 32) as usize;
+                send_out(&outbox, start, requester, Payload::Response { request_id });
                 log_event(
                     &log,
                     start,
@@ -559,7 +559,9 @@ fn run_simulation(config: Config) -> (u64, usize, usize) {
         // (ii) any message SENT during a window is delivered at >= its send time +
         //      lookahead, i.e. strictly after the window in which it was sent, so
         //      the delivery pass at the top of a later iteration always delivers it
-        //      before its destination island is stepped past it.
+        //      before its destination island is stepped past it. In a jumped
+        //      window, (i) also means no task runs before the window end, so every
+        //      send in such a window occurs exactly at the window end.
         // Both properties hold regardless of how far the cursor jumps.
         let next_by_lookahead = window_end + config.lookahead;
         window_end = match gvt {
@@ -567,9 +569,11 @@ fn run_simulation(config: Config) -> (u64, usize, usize) {
             _ => next_by_lookahead,
         };
 
-        // Safety valve: don't loop forever if the workload misbehaves.
+        // Safety valve: a draining workload finishes well before this horizon. Panic
+        // rather than break: a silent truncation here would hit both self-verification
+        // runs identically and turn a liveness bug into a false "OK".
         if window_end > config.duration + Duration::from_secs(10) {
-            break;
+            panic!("simulation failed to drain by {window_end:?}");
         }
     }
 
@@ -580,6 +584,9 @@ fn run_simulation(config: Config) -> (u64, usize, usize) {
         let log = island.log.lock().unwrap();
         for (t, text) in log.iter() {
             digest.write(&(t.as_nanos() as u64).to_le_bytes());
+            // Length-prefix the text so the serialization is injective: without it,
+            // two different event sequences could feed identical bytes to the digest.
+            digest.write(&(text.len() as u64).to_le_bytes());
             digest.write(text.as_bytes());
             total_events += 1;
         }
