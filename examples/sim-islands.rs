@@ -12,6 +12,12 @@
 //! the same seed twice (once with the configured controller thread count, once
 //! single-threaded) and asserts both runs produce the identical event-log digest.
 //!
+//! The elapsed wall-clock times are printed for information only. This controller
+//! spawns fresh threads every window, and that dispatch cost dominates at these
+//! workload sizes, so the times do not demonstrate the scaling a persistent
+//! worker-pool controller achieves (see the `rt_quiesce` benchmark for that); they
+//! are not a measure of the cost of `quiesce_until` itself.
+//!
 //! Run with:
 //!
 //!     cargo run --release --example sim-islands
@@ -647,6 +653,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (digest_b, windows_b, events_b) = run_simulation(single);
     let elapsed_b = wall.elapsed();
 
+    // The elapsed times are informational only; this controller's per-window thread
+    // spawning dominates them (see the note in the doc comment at the top).
     println!(
         "run A ({} threads): digest {digest_a:016x}, {windows_a} windows, {events_a} events, {elapsed_a:?}",
         config.threads
