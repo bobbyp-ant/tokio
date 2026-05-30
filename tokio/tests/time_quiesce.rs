@@ -921,9 +921,13 @@ async fn dropping_unresolved_quiesce_deregisters() {
 #[test]
 fn many_runtimes_step_independently_from_threads() {
     // Each "island" gets its own timer cadence; each is stepped by its own thread.
+    // The barrier makes all islands start their stepping loops together, so the
+    // steps genuinely overlap rather than potentially running one island at a time.
+    let barrier = Arc::new(std::sync::Barrier::new(4));
     let mut threads = Vec::new();
 
     for island in 1..=4u64 {
+        let barrier = barrier.clone();
         threads.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -948,6 +952,9 @@ fn many_runtimes_step_independently_from_threads() {
                     }
                 });
             }
+
+            // Wait for every island to finish its setup before stepping.
+            barrier.wait();
 
             // Step in 4 windows of island*10 ms each: exactly one event per window.
             let mut nows = Vec::new();
@@ -1180,8 +1187,12 @@ fn windowed_stepping_is_deterministic() {
         let mut reports = Vec::new();
         let mut window_end = start;
         for w in 0..8u64 {
-            // Inject an external message between windows.
-            tx.send(format!("msg-{w}")).unwrap();
+            // Inject an external message between windows. Message lengths vary so
+            // the per-message echo delays (derived from the length) span the whole
+            // 1..=5ms range instead of collapsing to a single value, making echo
+            // and tick events interleave differently from window to window.
+            tx.send(format!("msg-{w}-{}", "x".repeat(w as usize)))
+                .unwrap();
 
             window_end += Duration::from_millis(5);
             let state = rt.block_on(time::quiesce_until(window_end));
