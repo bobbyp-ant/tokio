@@ -30,7 +30,7 @@ async fn quiesce_until_fires_timers_within_bound() {
     assert_eq!(state.now, start + Duration::from_millis(30));
     // The 40ms timer is within 64ms of `now` => bottom wheel level => exact.
     assert_eq!(state.next_timer, Some(start + Duration::from_millis(40)));
-    // AC1.7: the clock has not moved between resolution and return.
+    // The clock has not moved between resolution and return.
     assert_eq!(Instant::now(), state.now);
 }
 
@@ -66,7 +66,7 @@ async fn quiesce_until_drains_transitive_work() {
 
     // The full chain (timer -> channel -> task -> spawned task) completed.
     assert_eq!(result.load(SeqCst), 42);
-    // AC1.2: the clock stops at the last timer (5ms), never advanced to the bound.
+    // The clock stops at the last timer (5ms), never advanced to the bound.
     assert_eq!(state.now, start + Duration::from_millis(5));
     assert_eq!(state.next_timer, None);
     assert_eq!(Instant::now(), state.now);
@@ -199,7 +199,7 @@ async fn quiesce_until_far_timer_refinement_hops() {
     let next = state.next_timer.expect("timer still pending");
     assert!(next > state.now);
     assert!(next <= start + Duration::from_millis(5_000));
-    // AC1.7 always holds.
+    // The clock has not moved between resolution and return.
     assert_eq!(Instant::now(), state.now);
 }
 
@@ -501,12 +501,12 @@ fn quiesce_from_enter_guard_thread_wakes_parked_runtime() {
     rt_thread.join().unwrap();
 }
 
-// ===== Misuse panics (rt-quiesce.AC3) =====
+// ===== Misuse panics =====
 //
-// AC3.3's inhibit_auto_advance()-outside-runtime case is covered in
+// The inhibit_auto_advance()-outside-runtime panic case is covered in
 // tests/time_pause.rs (inhibit_auto_advance_outside_runtime_panics).
 
-/// rt-quiesce.AC3.1: awaiting `Quiesce` on a multi-thread runtime panics with a
+/// Awaiting `Quiesce` on a multi-thread runtime panics with a
 /// message naming the current_thread requirement.
 #[cfg(feature = "test-util")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -515,7 +515,7 @@ async fn quiesce_multi_thread_panics() {
     let _ = time::quiesce().await;
 }
 
-/// rt-quiesce.AC3.2: awaiting `Quiesce` on a runtime whose clock is not paused
+/// Awaiting `Quiesce` on a runtime whose clock is not paused
 /// panics with a message naming the paused-clock requirement.
 #[cfg(feature = "test-util")]
 #[tokio::test]
@@ -525,7 +525,7 @@ async fn quiesce_unpaused_clock_panics() {
     let _ = time::quiesce().await;
 }
 
-/// rt-quiesce.AC3.3: polling `Quiesce` outside any runtime context panics with the
+/// Polling `Quiesce` outside any runtime context panics with the
 /// standard tokio context-missing message.
 #[cfg(feature = "test-util")]
 #[test]
@@ -537,7 +537,7 @@ fn quiesce_poll_outside_runtime_panics() {
     let _ = quiesce.poll();
 }
 
-/// rt-quiesce.AC3.4: awaiting `Quiesce` on a runtime built without a time driver
+/// Awaiting `Quiesce` on a runtime built without a time driver
 /// panics with the standard timers-disabled message.
 #[cfg(feature = "test-util")]
 #[test]
@@ -556,7 +556,7 @@ fn quiesce_without_time_driver_panics() {
     });
 }
 
-/// rt-quiesce.AC3.5: `resume()` while any quiesce waiter is registered panics
+/// `resume()` while any quiesce waiter is registered panics
 /// (stepping and a running wall clock are mutually exclusive).
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
@@ -582,7 +582,7 @@ async fn resume_during_quiesce_panics() {
     time::resume();
 }
 
-/// rt-quiesce.AC3.6: `advance()` while any quiesce waiter is registered panics: an
+/// `advance()` while any quiesce waiter is registered panics: an
 /// explicit advance would move the clock past the step's bound and break
 /// reproducibility.
 #[cfg(feature = "test-util")]
@@ -775,9 +775,9 @@ fn shutdown_with_quiesce_waiter_does_not_poison_time_apis() {
     time::resume();
 }
 
-// ===== Interaction semantics (rt-quiesce.AC2) =====
+// ===== Interaction semantics =====
 
-/// rt-quiesce.AC2.1: an outstanding `spawn_blocking` task defers quiesce resolution;
+/// An outstanding `spawn_blocking` task defers quiesce resolution;
 /// the step returns only after the blocking task completed AND the async task
 /// awaiting it has been polled (its completion processed).
 ///
@@ -830,7 +830,7 @@ fn quiesce_until_processes_blocking_task_completion() {
     assert_eq!(state.next_timer, None);
 }
 
-/// rt-quiesce.AC2.2: a held `AutoAdvanceGuard` with a timer at-or-below the bound
+/// A held `AutoAdvanceGuard` with a timer at-or-below the bound
 /// makes the step wait in real time; dropping the guard from another thread lets the
 /// in-progress step complete (timer fires, work runs, then resolution) without
 /// restarting it.
@@ -887,7 +887,7 @@ fn quiesce_waits_for_guard_when_timer_within_bound() {
     th.join().unwrap();
 }
 
-/// rt-quiesce.AC2.3: a held guard does NOT prevent resolution when no timer at or
+/// A held guard does NOT prevent resolution when no timer at or
 /// below the bound is pending (the guard only blocks auto-advance, not quiescence).
 #[cfg(feature = "test-util")]
 #[test]
@@ -931,7 +931,7 @@ fn quiesce_resolves_despite_guard_when_no_timer_within_bound() {
     drop(guard);
 }
 
-/// rt-quiesce.AC2.4: concurrent waiters resolve according to their own bounds. On a
+/// Concurrent waiters resolve according to their own bounds. On a
 /// single drain-park, every waiter whose bound lies below the next expiration
 /// resolves, and the clock does not advance on a cycle that resolved waiters.
 #[cfg(feature = "test-util")]
@@ -967,7 +967,7 @@ async fn multiple_waiters_resolve_per_their_bounds() {
     assert_eq!(rc.next_timer, None);
 }
 
-/// rt-quiesce.AC2.7: dropping an unresolved `Quiesce` deregisters its waiter, and
+/// Dropping an unresolved `Quiesce` deregisters its waiter, and
 /// subsequent auto-advance behavior is unchanged.
 ///
 /// Deregistration is observed two ways: (1) `advance()` works again (it panics while
@@ -1001,7 +1001,7 @@ async fn dropping_unresolved_quiesce_deregisters() {
     assert_eq!(Instant::now(), start + Duration::from_millis(100));
 }
 
-/// rt-quiesce.AC2.5: many paused runtimes in one process step independently, driven
+/// Many paused runtimes in one process step independently, driven
 /// concurrently from different controller threads, without affecting each other's
 /// clocks or reports.
 #[cfg(feature = "test-util")]
@@ -1071,7 +1071,7 @@ fn many_runtimes_step_independently_from_threads() {
     }
 }
 
-/// rt-quiesce.AC2.8 (quiesce-context variant): a guard targets the runtime it was
+/// A guard targets the runtime it was
 /// created on. Dropping A's guard while B's context is current releases A's inhibit,
 /// letting A's in-progress quiesce step complete. (The complementary assertion --
 /// that the drop never releases the AMBIENT runtime's inhibit -- is covered by
@@ -1134,7 +1134,7 @@ fn guard_dropped_in_other_runtime_context_releases_originator() {
     drop(rt_b);
 }
 
-/// rt-quiesce.AC2.6: the API behaves identically on `LocalRuntime`, including with
+/// The API behaves identically on `LocalRuntime`, including with
 /// !Send tasks spawned via `spawn_local`.
 #[cfg(feature = "test-util")]
 #[test]
@@ -1178,10 +1178,10 @@ fn quiesce_on_local_runtime() {
 
 /// EXPLORATORY (non-contractual): `Quiesce` awaited inside `LocalSet::run_until`.
 ///
-/// `LocalSet` is explicitly out of scope for the quiesce contract (see the design
-/// plan); this test documents observed behavior rather than a guarantee. If it
-/// fails after a tokio upgrade, re-evaluate rather than treating it as a regression
-/// of the quiesce contract.
+/// `LocalSet` is explicitly out of scope for the quiesce contract; this test
+/// documents observed behavior rather than a guarantee. If it fails after a tokio
+/// upgrade, re-evaluate rather than treating it as a regression of the quiesce
+/// contract.
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
 async fn quiesce_inside_local_set_run_until_exploratory() {
@@ -1207,9 +1207,9 @@ async fn quiesce_inside_local_set_run_until_exploratory() {
     assert_eq!(state.now, start + Duration::from_millis(10));
 }
 
-// ===== Determinism (rt-quiesce.AC1.6) =====
+// ===== Determinism =====
 
-/// rt-quiesce.AC1.6: a windowed stepping loop with messages injected between windows
+/// A windowed stepping loop with messages injected between windows
 /// produces identical `QuiescedState` reports and an identical application event log
 /// on every run with the same inputs.
 ///
