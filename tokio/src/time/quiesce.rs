@@ -116,8 +116,9 @@ enum State {
 /// The returned future panics when polled if:
 /// - polled outside a Tokio runtime context,
 /// - the runtime is not the `current_thread` flavor,
-/// - the runtime's clock is not paused, or
-/// - the runtime has no time driver (`enable_time()`/`enable_all()` not called).
+/// - the runtime's clock is not paused,
+/// - the runtime has no time driver (`enable_time()`/`enable_all()` not called), or
+/// - the runtime has shut down.
 ///
 /// While the future is registered (polled at least once and not yet resolved),
 /// calling [`resume`] or [`advance`] on the runtime panics: an explicit clock change
@@ -242,8 +243,9 @@ pub fn quiesce() -> Quiesce {
 /// The returned future panics when polled if:
 /// - polled outside a Tokio runtime context,
 /// - the runtime is not the `current_thread` flavor,
-/// - the runtime's clock is not paused, or
-/// - the runtime has no time driver (`enable_time()`/`enable_all()` not called).
+/// - the runtime's clock is not paused,
+/// - the runtime has no time driver (`enable_time()`/`enable_all()` not called), or
+/// - the runtime has shut down.
 ///
 /// While the future is registered (polled at least once and not yet resolved),
 /// calling [`resume`] or [`advance`] on the runtime panics: an explicit clock change
@@ -353,7 +355,15 @@ impl Quiesce {
             );
         }
 
-        let id = time_handle.register_quiesce_waiter(bound, waker);
+        // Registration is refused once the driver is shutting down. The check runs
+        // under the waiter-registry lock, so it cannot race the shutdown drain: a
+        // waiter that landed after the drain would never be woken, hanging the
+        // caller forever. Mirror TimerEntry: a quiesce on a shut-down runtime is a
+        // bug.
+        let id = match time_handle.register_quiesce_waiter(bound, waker) {
+            Some(id) => id,
+            None => panic!("{}", crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR),
+        };
 
         // This poll may be running on a thread that merely holds a `Handle::enter`
         // guard while the target runtime is parked on its own thread. Nothing else

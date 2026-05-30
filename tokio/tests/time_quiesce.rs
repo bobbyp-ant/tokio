@@ -644,6 +644,93 @@ fn quiesce_polled_after_shutdown_panics() {
     let _ = quiesce.as_mut().poll(&mut cx);
 }
 
+/// A `Quiesce` future first-polled after its runtime has already shut down panics
+/// with the standard runtime-shutdown message. Registration checks for shutdown
+/// under the waiter-registry lock, so a waiter can never land on a dead driver --
+/// nothing would ever wake it, and an awaiting caller would hang forever.
+#[cfg(feature = "test-util")]
+#[test]
+#[should_panic(expected = "A Tokio 1.x context was found, but it is being shutdown.")]
+fn quiesce_first_polled_after_shutdown_panics() {
+    use futures::task::noop_waker_ref;
+    use std::future::Future;
+    use std::task::Context;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let handle = rt.handle().clone();
+
+    // Shut the runtime down before the future is ever polled.
+    drop(rt);
+
+    // The first poll (registration) must observe the shutdown and panic; it must
+    // not register a waiter on the dead driver and return `Pending`.
+    let mut quiesce = Box::pin(time::quiesce());
+    let _enter = handle.enter();
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let _ = quiesce.as_mut().poll(&mut cx);
+}
+
+/// The first-poll-after-shutdown panic leaves no state behind: the refused
+/// registration never bumps the waiter count that backs the `resume()`/`advance()`
+/// mutual-exclusion check, so time APIs keep working both through the shut-down
+/// runtime's still-live handle and on a fresh runtime.
+#[cfg(feature = "test-util")]
+#[test]
+fn quiesce_first_poll_after_shutdown_does_not_poison_time_apis() {
+    use futures::task::noop_waker_ref;
+    use std::future::Future;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::task::Context;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let handle = rt.handle().clone();
+
+    drop(rt);
+
+    // The first poll panics: registration is refused on the shut-down driver.
+    let mut quiesce = Box::pin(time::quiesce());
+    let poll_result = catch_unwind(AssertUnwindSafe(|| {
+        let _enter = handle.enter();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let _ = quiesce.as_mut().poll(&mut cx);
+    }));
+    assert!(poll_result.is_err(), "first poll after shutdown must panic");
+
+    // No phantom waiter was left behind: `resume()` through the shut-down
+    // runtime's handle works (it would panic with "cannot be called while a
+    // `quiesce()` is in progress" if the refused registration had bumped the
+    // waiter count).
+    {
+        let _enter = handle.enter();
+        time::resume();
+    }
+
+    // Dropping the never-registered future is a no-op as well.
+    drop(quiesce);
+
+    // Time APIs on a fresh runtime are unaffected.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        tokio::spawn(async {
+            time::sleep(Duration::from_millis(1)).await;
+        });
+        let state = time::quiesce().await;
+        assert!(state.next_timer.is_none());
+    });
+}
+
 /// Driver shutdown drains the quiesce waiter registry; it must also reset the
 /// waiter count that backs the `resume()`/`advance()` mutual-exclusion check. A
 /// stale count would make those APIs, called through a still-live `Handle` of the

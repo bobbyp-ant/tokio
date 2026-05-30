@@ -543,7 +543,15 @@ impl Handle {
 
         /// Registers a quiesce waiter with an optional inclusive bound (as an
         /// `Instant`; converted to a wheel tick with the same round-up rule `Sleep`
-        /// uses). Returns the registration id.
+        /// uses). Returns the registration id, or `None` if the driver is shutting
+        /// down and registration is refused.
+        ///
+        /// The shutdown check happens under the registry lock: `Driver::shutdown`
+        /// stores the shutdown flag before taking this same lock to drain the
+        /// registry, so a registration that observes the flag unset is guaranteed
+        /// to land before the drain (and be woken by it), while one that observes
+        /// it set must not land at all -- a waiter registered after the drain would
+        /// never be woken.
         ///
         /// The caller is responsible for unparking the target runtime's driver
         /// afterwards so a parked runtime notices the new waiter; this handle alone
@@ -553,10 +561,15 @@ impl Handle {
             &self,
             bound: Option<crate::time::Instant>,
             waker: &std::task::Waker,
-        ) -> u64 {
+        ) -> Option<u64> {
             let bound_tick = bound.map(|b| self.time_source.deadline_to_tick(b));
 
             let mut lock = self.inner.lock();
+
+            if self.is_shutdown() {
+                return None;
+            }
+
             let id = lock.next_quiesce_waiter_id;
             lock.next_quiesce_waiter_id += 1;
             lock.quiesce_waiters.push(QuiesceWaiter {
@@ -571,7 +584,7 @@ impl Handle {
             self.quiesce_waiter_count.fetch_add(1, Ordering::Relaxed);
             drop(lock);
 
-            id
+            Some(id)
         }
 
         /// Polls a registered waiter: if it has resolved, removes it and returns the
