@@ -822,3 +822,202 @@ async fn dropping_unresolved_quiesce_deregisters() {
     time::sleep_until(start + Duration::from_millis(100)).await;
     assert_eq!(Instant::now(), start + Duration::from_millis(100));
 }
+
+/// rt-quiesce.AC2.5: many paused runtimes in one process step independently, driven
+/// concurrently from different controller threads, without affecting each other's
+/// clocks or reports.
+#[cfg(feature = "test-util")]
+#[test]
+fn many_runtimes_step_independently_from_threads() {
+    // Each "island" gets its own timer cadence; each is stepped by its own thread.
+    let mut threads = Vec::new();
+
+    for island in 1..=4u64 {
+        threads.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+
+            let start = {
+                let _enter = rt.enter();
+                Instant::now()
+            };
+
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            {
+                let log = log.clone();
+                let _enter = rt.enter();
+                // Island i fires events every i*10 ms.
+                rt.spawn(async move {
+                    for n in 1..=4u64 {
+                        time::sleep_until(start + Duration::from_millis(n * island * 10)).await;
+                        log.lock().unwrap().push(n * island * 10);
+                    }
+                });
+            }
+
+            // Step in 4 windows of island*10 ms each: exactly one event per window.
+            let mut nows = Vec::new();
+            for w in 1..=4u64 {
+                let state = rt.block_on(time::quiesce_until(
+                    start + Duration::from_millis(w * island * 10),
+                ));
+                // Report positions are island-local virtual offsets.
+                nows.push(state.now - start);
+            }
+
+            let events = log.lock().unwrap().clone();
+            (island, events, nows)
+        }));
+    }
+
+    for th in threads {
+        let (island, log, nows) = th.join().unwrap();
+        // Each island saw exactly its own cadence, unaffected by the other islands
+        // stepping concurrently in the same process.
+        let expected_log: Vec<u64> = (1..=4).map(|n| n * island * 10).collect();
+        assert_eq!(log, expected_log, "island {island}");
+        let expected_nows: Vec<Duration> = (1..=4)
+            .map(|n| Duration::from_millis(n * island * 10))
+            .collect();
+        assert_eq!(nows, expected_nows, "island {island}");
+    }
+}
+
+/// rt-quiesce.AC2.8 (quiesce-context variant): a guard targets the runtime it was
+/// created on. Dropping A's guard while B's context is current releases A's inhibit,
+/// letting A's in-progress quiesce step complete. (The complementary assertion --
+/// that the drop never releases the AMBIENT runtime's inhibit -- is covered by
+/// `auto_advance_guard_targets_originating_runtime` in tests/time_pause.rs.)
+#[cfg(feature = "test-util")]
+#[test]
+fn guard_dropped_in_other_runtime_context_releases_originator() {
+    let rt_a = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let rt_b = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let start_a = {
+        let _enter = rt_a.enter();
+        Instant::now()
+    };
+
+    let guard_a = {
+        let _enter = rt_a.enter();
+        time::inhibit_auto_advance()
+    };
+
+    // A timer within A's bound, so A's step can only complete after guard_a drops.
+    {
+        let _enter = rt_a.enter();
+        rt_a.spawn(async move {
+            time::sleep_until(start_a + Duration::from_millis(5)).await;
+        });
+    }
+
+    let handle_b = rt_b.handle().clone();
+    let wall_start = std::time::Instant::now();
+    let th = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        // Drop A's guard while B's context is current on this thread.
+        let _enter_b = handle_b.enter();
+        drop(guard_a);
+    });
+
+    // A's step completes after ~100ms (guard_a released A despite B being current at
+    // drop time).
+    let state = rt_a.block_on(time::quiesce_until(start_a + Duration::from_millis(10)));
+    let elapsed = wall_start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "elapsed: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(10), "elapsed: {elapsed:?}");
+    assert_eq!(state.now, start_a + Duration::from_millis(5));
+    assert_eq!(state.next_timer, None);
+
+    th.join().unwrap();
+    drop(rt_b);
+}
+
+/// rt-quiesce.AC2.6: the API behaves identically on `LocalRuntime`, including with
+/// !Send tasks spawned via `spawn_local`.
+#[cfg(feature = "test-util")]
+#[test]
+fn quiesce_on_local_runtime() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build_local(tokio::runtime::LocalOptions::default())
+        .unwrap();
+
+    let start = {
+        let _enter = rt.enter();
+        Instant::now()
+    };
+
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        let _enter = rt.enter();
+        rt.spawn_local(async move {
+            // A !Send value held across an await proves this is really a local task.
+            let rc = std::rc::Rc::new(1u64);
+            time::sleep_until(start + Duration::from_millis(10)).await;
+            fired.fetch_add(*rc as usize, SeqCst);
+        });
+    }
+
+    let state = rt.block_on(time::quiesce_until(start + Duration::from_millis(20)));
+
+    assert_eq!(fired.load(SeqCst), 1);
+    assert_eq!(state.now, start + Duration::from_millis(10));
+    assert_eq!(state.next_timer, None);
+    assert_eq!(
+        {
+            let _enter = rt.enter();
+            Instant::now()
+        },
+        state.now
+    );
+}
+
+/// EXPLORATORY (non-contractual): `Quiesce` awaited inside `LocalSet::run_until`.
+///
+/// `LocalSet` is explicitly out of scope for the quiesce contract (see the design
+/// plan); this test documents observed behavior rather than a guarantee. If it
+/// fails after a tokio upgrade, re-evaluate rather than treating it as a regression
+/// of the quiesce contract.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn quiesce_inside_local_set_run_until_exploratory() {
+    let start = Instant::now();
+    let local = tokio::task::LocalSet::new();
+
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        local.spawn_local(async move {
+            time::sleep_until(start + Duration::from_millis(10)).await;
+            fired.fetch_add(1, SeqCst);
+        });
+    }
+
+    let state = local
+        .run_until(time::quiesce_until(start + Duration::from_millis(20)))
+        .await;
+
+    // Observed behavior: LocalSet's self-waking design composes with quiesce; the
+    // local task's timer fires and the step resolves after it.
+    assert_eq!(fired.load(SeqCst), 1);
+    assert_eq!(state.now, start + Duration::from_millis(10));
+}
