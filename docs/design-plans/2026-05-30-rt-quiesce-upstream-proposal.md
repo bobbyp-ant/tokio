@@ -68,9 +68,10 @@ outstanding, and no timer with a deadline at or before the bound remains unfired
 (`quiesce()` is the unbounded case: it resolves only once no timers remain at all). The
 call itself never advances the clock. During a step the clock moves only to positions
 auto-advance already visits — timer deadlines, and occupied-slot boundaries for far-out
-timers — and a step in which nothing fires leaves the clock untouched. Stepping is driven
-either by passing the future to `Runtime::block_on` from the controlling thread, or by
-awaiting it inside a task on the runtime.
+timers — and a step in which nothing fires and whose bound reaches no such slot boundary
+leaves the clock untouched (see the precision contract below). Stepping is driven either
+by passing the future to `Runtime::block_on` from the controlling thread, or by awaiting
+it inside a task on the runtime.
 
 **Precision contract.** `QuiescedState::now` is where the clock stopped; it is never past
 the bound. `QuiescedState::next_timer` is a lower bound on the earliest pending timer
@@ -80,7 +81,8 @@ exact when that deadline lies in the timer wheel's bottom level (the same 64 ms 
 occupied slot, which is at or before the actual deadline. The upper wheel levels do not
 store exact deadlines, so an exact `next_timer` for far-out timers would require a
 different data structure; a lower bound is the honest contract, and stepping refines it —
-each `quiesce_until` step either fires the timer or moves the clock closer to it.
+each `quiesce_until` step that reaches the timer's occupied slot either fires the timer
+or moves the clock closer to it.
 
 **Misuse panics.** The future panics when polled outside a runtime context, on the
 multi-thread flavor, on an unpaused clock, on a runtime built without a time driver, or on
