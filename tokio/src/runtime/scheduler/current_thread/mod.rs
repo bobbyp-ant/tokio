@@ -422,13 +422,15 @@ impl Context {
     /// Takes the drain-park: parks the thread until an event arrives.
     ///
     /// With `test-util`, registered `quiesce()` waiters are given a chance to resolve
-    /// first; if any resolve, the park is skipped (the resolved waiter is now
-    /// runnable work).
+    /// first. The park is skipped when the resolution pass either resolves a waiter
+    /// (the woken waiter is now runnable work) or discovers other runnable work
+    /// (which the pass's driver poll may have consumed the wakeup for — parking then
+    /// would never wake up).
     #[cfg(feature = "test-util")]
     fn park_drain(&self, core: Box<Core>, handle: &Handle, driver: &mut Driver) -> Box<Core> {
-        let (core, resolved) = self.try_resolve_quiesce_waiters(core, handle, driver);
+        let (core, skip_park) = self.quiesce_park_hook(core, handle, driver);
 
-        if resolved {
+        if skip_park {
             core
         } else {
             self.park_internal(core, handle, driver, None)
@@ -452,18 +454,52 @@ impl Context {
     ///  1. Performs a zero-timeout driver poll. This surfaces IO readiness, fires
     ///     timers already due at the current (paused, unmoved) virtual time, and lets
     ///     raced cross-thread wakes land.
-    ///  2. Re-checks, using only state the scheduler and clock own, that nothing
-    ///     became runnable and no blocking task is outstanding. The time driver's
-    ///     `did_wake` flag is deliberately NOT read (and must not be consumed) here —
-    ///     it keeps its existing role as the auto-advance veto in the fall-through
-    ///     park.
-    ///  3. Resolves every waiter whose bound lies strictly below the wheel's next
-    ///     expiration (or all waiters if the wheel is empty), waking them.
     ///
-    /// Returns `(core, true)` if at least one waiter resolved — the caller must then
-    /// skip the park; the clock is never advanced on a cycle that resolved a waiter.
+    ///     This poll CONSUMES any pending wakeup: the IO driver's wakeup event is
+    ///     observed once and discarded, and the time driver's `did_wake` flag is
+    ///     destructively read by `park_thread_timeout`'s auto-advance branch (the
+    ///     zero-duration "advance" itself is a no-op). Once the poll has run, a
+    ///     wakeup that was pending before it can no longer terminate a later park.
+    ///
+    ///  2. Reads the blocking-inhibit count, BEFORE the runnable-work re-check. The
+    ///     count is decremented by a completing `spawn_blocking` task only after its
+    ///     body ran (`BlockingSchedule::release`), so observing "no inhibits" here
+    ///     guarantees that step 3 sees any work a completed blocking task published
+    ///     (for example a channel send performed inside the blocking closure).
+    ///     Reading it in the other order would allow a blocking task to complete
+    ///     between the two checks and have its final wakes miss both.
+    ///
+    ///  3. Re-checks whether anything became runnable: run queue, deferred wakers,
+    ///     the root future's woken flag, and the inject queue. If so, the park MUST
+    ///     be skipped — the wakeup announcing that work was just consumed by step 1,
+    ///     so an indefinite park would never wake. Skipping the park returns to the
+    ///     scheduler loop, which processes the work and comes back here.
+    ///
+    ///     This re-check is also what makes consuming `did_wake` in step 1 sound:
+    ///     every `did_wake` setter publishes its work (inject push, woken flag,
+    ///     blocking-inhibit release, auto-advance-guard release) before unparking,
+    ///     so the re-check observes that work and the park — and therefore any
+    ///     auto-advance the flag would have vetoed — is skipped. When the re-check
+    ///     finds nothing, the wake has been fully serviced and a subsequent
+    ///     auto-advance is correct.
+    ///
+    ///  4. If nothing is runnable but a `spawn_blocking` task was outstanding at
+    ///     step 2, the runtime is not quiescent (blocking work implies future
+    ///     wakes); fall through to the real park. This cannot lose a wakeup: the
+    ///     inhibit was observed as held, so the blocking task's release — which
+    ///     decrements the count and THEN unparks the driver — had not yet run at
+    ///     step 2, which is after the poll in step 1; its unpark therefore cannot
+    ///     have been consumed and will terminate the park.
+    ///
+    ///  5. Otherwise resolves every waiter whose bound lies strictly below the
+    ///     wheel's next expiration (or all waiters if the wheel is empty), waking
+    ///     them inside this `enter` scope.
+    ///
+    /// Returns `(core, skip_park)`. `skip_park` is true when runnable work was
+    /// discovered (step 3) or at least one waiter resolved (step 5); the caller must
+    /// then skip the park. The clock is never advanced on a skipped-park cycle.
     #[cfg(feature = "test-util")]
-    fn try_resolve_quiesce_waiters(
+    fn quiesce_park_hook(
         &self,
         core: Box<Core>,
         handle: &Handle,
@@ -479,7 +515,7 @@ impl Context {
             return (core, false);
         }
 
-        // `self.enter` returns `(core, R)`; `R` is the closure's resolution result.
+        // `self.enter` returns `(core, R)`; `R` is the closure's skip-park decision.
         self.enter(core, || {
             // (1) Zero-timeout driver poll. Tasks woken here (timer firings, IO
             // readiness) are pushed onto the core inside the RefCell via the normal
@@ -487,22 +523,34 @@ impl Context {
             driver.park_timeout(&handle.driver, Duration::from_millis(0));
             self.defer.wake();
 
-            // (2) Runnable-work re-check. The core lives in the Context RefCell while
+            // (2) Blocking-inhibit read; must happen before the runnable-work
+            // re-check (see the doc comment).
+            let blocking_inhibited = handle.driver.clock.has_blocking_inhibits();
+
+            // (3) Runnable-work re-check. The core lives in the Context RefCell while
             // inside `enter`.
-            let nothing_runnable = {
+            let runnable = {
                 let core_ref = self.core.borrow();
                 let core_ref = core_ref.as_ref().expect("core missing");
-                core_ref.tasks.is_empty()
-            } && self.defer.is_empty()
-                && !handle.shared.woken.load(Acquire)
-                && handle.injection_queue_depth() == 0
-                && !handle.driver.clock.has_blocking_inhibits();
+                !core_ref.tasks.is_empty()
+            } || !self.defer.is_empty()
+                || handle.shared.woken.load(Acquire)
+                || handle.injection_queue_depth() > 0;
 
-            if !nothing_runnable {
+            if runnable {
+                // The wakeup that announced this work may have been consumed by the
+                // poll above; parking now could hang forever. Skip the park.
+                return true;
+            }
+
+            // (4) Outstanding blocking work: not quiescent, and parking is safe (the
+            // blocking completion's unpark cannot have been consumed yet; see the doc
+            // comment).
+            if blocking_inhibited {
                 return false;
             }
 
-            // (3) Resolve eligible waiters. Their wakes happen inside this `enter`
+            // (5) Resolve eligible waiters. Their wakes happen inside this `enter`
             // scope, so spawned-task waiters land on the run queue and the root-future
             // waiter sets the `woken` flag.
             match &handle.driver.time {
