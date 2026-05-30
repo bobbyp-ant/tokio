@@ -569,10 +569,16 @@ fn run_simulation(config: Config) -> (u64, usize, usize) {
             _ => next_by_lookahead,
         };
 
-        // Safety valve: a draining workload finishes well before this horizon. Panic
-        // rather than break: a silent truncation here would hit both self-verification
-        // runs identically and turn a liveness bug into a false "OK".
-        if window_end > config.duration + Duration::from_secs(10) {
+        // Safety valve: a draining workload finishes well before this horizon. The
+        // post-duration drain tail scales with lookahead: a request's round trip is
+        // 4 network hops (frontend -> orch -> backend -> orch -> frontend), each with
+        // latency in [lookahead, 2*lookahead), so the last response lands within
+        // 8*lookahead of the last request (plus backend processing, plus up to one
+        // window of cursor overshoot). 16*lookahead is a 2x margin over that, and the
+        // absolute 10s grace covers processing time at tiny lookaheads. Panic rather
+        // than break: a silent truncation here would hit both self-verification runs
+        // identically and turn a liveness bug into a false "OK".
+        if window_end > config.duration + 16 * config.lookahead + Duration::from_secs(10) {
             panic!("simulation failed to drain by {window_end:?}");
         }
     }
