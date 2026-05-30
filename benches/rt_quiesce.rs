@@ -4,7 +4,8 @@
 //! Measures per-window stepping overhead and multi-core scaling of a balanced
 //! synthetic island world: N paused current_thread runtimes, each with a 1 ms
 //! periodic timer, a fixed CPU budget per tick, and a ring message to its neighbor,
-//! stepped in lookahead-sized windows by a pool of controller threads.
+//! stepped in lookahead-sized windows by a persistent pool of controller worker
+//! threads.
 //!
 //! Requires the `test-util` feature:
 //!
@@ -20,10 +21,18 @@
 //! - The per-tick CPU budget is a fixed iteration count; its wall-clock cost is
 //!   measured and printed at startup so results can be read as "this much useful
 //!   work per island per 1 ms window".
+//! - Controller worker threads form a persistent pool created once per benchmark
+//!   iteration, outside the timed section (pool creation is setup, like building
+//!   the runtimes). Workers persist across all windows of an iteration and
+//!   synchronize with the dispatcher twice per window through spin-synced
+//!   atomics (a published window sequence number and a completion count), so
+//!   the timed window loop contains no thread spawning and no scheduler
+//!   handoffs.
 
 #[cfg(feature = "test-util")]
 mod bench {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -135,15 +144,152 @@ mod bench {
         }
     }
 
-    /// Runs the windowed simulation across `threads` controller threads. Returns the
-    /// number of windows stepped. ONLY this function is inside the timed section.
-    fn run_world(
+    /// State shared between the dispatcher and the persistent pool workers.
+    ///
+    /// Synchronization is a pair of spin-synced atomics rather than
+    /// `std::sync::Barrier`: with tens of workers, the mutex/condvar handoff
+    /// inside `Barrier` costs several microseconds per worker per crossing
+    /// (every waiter serializes on one mutex and the wakeup goes through the
+    /// scheduler), which at 32 workers adds up to hundreds of microseconds per
+    /// window and dominates the windows being measured. The atomics keep
+    /// per-window synchronization in the single-digit-microsecond range,
+    /// independent of worker count.
+    struct PoolShared {
+        /// Number of pool workers reporting into `done_count`.
+        n_workers: usize,
+        /// Sequence number of the published window. The dispatcher increments it
+        /// to release workers into the next window; workers spin on it.
+        window_seq: AtomicU64,
+        /// Virtual end of the published window, in nanoseconds since island
+        /// start. Written by the dispatcher before it bumps `window_seq`.
+        window_end_nanos: AtomicU64,
+        /// Number of workers that have finished stepping the published window.
+        /// The dispatcher spins on it reaching `n_workers`, then resets it.
+        done_count: AtomicUsize,
+        /// Set by the dispatcher before the final `window_seq` bump, telling
+        /// workers to exit instead of stepping another window.
+        shutdown: AtomicBool,
+    }
+
+    /// Spins until `ready` returns true. A bounded busy-spin phase keeps
+    /// microsecond-scale waits off the scheduler; longer waits fall back to
+    /// yielding so oversubscribed configurations (e.g. 64 workers plus the
+    /// dispatcher on 64 logical CPUs) stay live.
+    fn spin_wait(ready: impl Fn() -> bool) {
+        let mut spins = 0u32;
+        while !ready() {
+            if spins < 1_000 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Dispatcher-side handle to a running worker pool.
+    struct PoolHandle<'a> {
+        shared: &'a PoolShared,
+    }
+
+    impl PoolHandle<'_> {
+        /// Steps every island through one window ending at `window_end` (virtual
+        /// time since island start). Returns once all workers have finished.
+        fn step_window(&self, window_end: Duration) {
+            let shared = self.shared;
+            shared
+                .window_end_nanos
+                .store(window_end.as_nanos() as u64, Relaxed);
+            // Publish the window. The Release pairs with the workers' Acquire
+            // loads of `window_seq`, making `window_end_nanos` and the ring
+            // messages delivered by the dispatcher visible to them.
+            shared.window_seq.fetch_add(1, Release);
+            // Workers step their islands in parallel here. Their Release
+            // increments of `done_count` pair with this Acquire load, making the
+            // islands' outbox writes visible to the dispatcher.
+            spin_wait(|| shared.done_count.load(Acquire) >= shared.n_workers);
+            shared.done_count.store(0, Relaxed);
+        }
+    }
+
+    /// Creates a persistent pool of `threads` workers (clamped to the island count)
+    /// stepping `islands` in strided assignment (worker w steps islands w, w+k,
+    /// w+2k, ...), runs `f` with a handle to the pool, then shuts the pool down.
+    /// Pool creation and teardown happen outside `f`, so `f` can time a window
+    /// loop without measuring either.
+    fn with_worker_pool<R>(
         islands: &[Island],
         threads: usize,
+        f: impl FnOnce(&PoolHandle<'_>) -> R,
+    ) -> R {
+        let n_workers = threads.min(islands.len()).max(1);
+        let shared = PoolShared {
+            n_workers,
+            window_seq: AtomicU64::new(0),
+            window_end_nanos: AtomicU64::new(0),
+            done_count: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        };
+
+        std::thread::scope(|scope| {
+            for worker in 0..n_workers {
+                let shared = &shared;
+                scope.spawn(move || {
+                    let stepping = || {
+                        let mut next_window = 1u64;
+                        loop {
+                            // Wait for the dispatcher to publish window
+                            // `next_window`; shutdown is also signalled through a
+                            // `window_seq` bump.
+                            spin_wait(|| shared.window_seq.load(Acquire) >= next_window);
+                            if shared.shutdown.load(Relaxed) {
+                                break;
+                            }
+                            let window_end =
+                                Duration::from_nanos(shared.window_end_nanos.load(Relaxed));
+                            let mut idx = worker;
+                            while idx < islands.len() {
+                                let island = &islands[idx];
+                                let deadline = island.start + window_end;
+                                let _state = island.rt.block_on(time::quiesce_until(deadline));
+                                idx += n_workers;
+                            }
+                            // Report completion of this window to the dispatcher.
+                            shared.done_count.fetch_add(1, Release);
+                            next_window += 1;
+                        }
+                    };
+                    // A panicking worker would leave the dispatcher spinning on
+                    // `done_count` forever; turn worker panics into a loud process
+                    // abort instead of a silent benchmark hang.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(stepping)).is_err() {
+                        eprintln!("rt_quiesce: pool worker panicked; aborting");
+                        std::process::abort();
+                    }
+                });
+            }
+
+            let result = f(&PoolHandle { shared: &shared });
+
+            // Shutdown (untimed): publish one final pseudo-window with the
+            // shutdown flag set to release the workers; the scope joins them on
+            // exit.
+            shared.shutdown.store(true, Relaxed);
+            shared.window_seq.fetch_add(1, Release);
+
+            result
+        })
+    }
+
+    /// Runs the windowed simulation, stepping islands through the persistent
+    /// `pool`. Returns the number of windows stepped. ONLY this function is inside
+    /// the timed section.
+    fn run_world(
+        islands: &[Island],
+        pool: &PoolHandle<'_>,
         lookahead: Duration,
         horizon: Duration,
     ) -> usize {
-        let n_workers = threads.min(islands.len()).max(1);
         let mut window_end = Duration::ZERO;
         let mut windows = 0usize;
         // Ring messages in flight: (delivery_time, dst) pairs, kept sorted by insertion
@@ -170,25 +316,8 @@ mod bench {
                 }
             });
 
-            // (b) Step all islands in parallel (strided assignment).
-            std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                for worker in 0..n_workers {
-                    let islands_ref = &islands;
-                    handles.push(scope.spawn(move || {
-                        let mut idx = worker;
-                        while idx < islands_ref.len() {
-                            let island = &islands_ref[idx];
-                            let deadline = island.start + window_end;
-                            let _state = island.rt.block_on(time::quiesce_until(deadline));
-                            idx += n_workers;
-                        }
-                    }));
-                }
-                for h in handles {
-                    h.join().expect("controller worker panicked");
-                }
-            });
+            // (b) Step all islands in parallel (strided assignment across the pool).
+            pool.step_window(window_end);
 
             // (c) Collect outboxes (island-index order) and queue ring messages with
             //     latency exactly == lookahead.
@@ -251,14 +380,19 @@ mod bench {
                                         .map(|id| build_island(id, true, VIRTUAL_HORIZON))
                                         .collect();
 
-                                    // The simulation: timed.
-                                    let t0 = std::time::Instant::now();
-                                    let windows =
-                                        run_world(&world, threads, lookahead, VIRTUAL_HORIZON);
-                                    total += t0.elapsed();
+                                    // Pool creation/teardown: NOT timed (happens
+                                    // outside the closure passed to the pool).
+                                    total += with_worker_pool(&world, threads, |pool| {
+                                        // The simulation: timed.
+                                        let t0 = std::time::Instant::now();
+                                        let windows =
+                                            run_world(&world, pool, lookahead, VIRTUAL_HORIZON);
+                                        let elapsed = t0.elapsed();
+                                        black_box(windows);
+                                        elapsed
+                                    });
 
                                     // Teardown sanity (not timed): the ring was live.
-                                    black_box(windows);
                                     assert!(
                                         total_received(&world) > 0,
                                         "no ring messages were delivered"
@@ -305,14 +439,18 @@ mod bench {
                                     .map(|id| build_island(id, true, VIRTUAL_HORIZON))
                                     .collect();
 
-                                // The simulation: timed.
-                                let t0 = std::time::Instant::now();
-                                let windows =
-                                    run_world(&world, threads, lookahead, VIRTUAL_HORIZON);
-                                total += t0.elapsed();
+                                // Pool creation/teardown: NOT timed.
+                                total += with_worker_pool(&world, threads, |pool| {
+                                    // The simulation: timed.
+                                    let t0 = std::time::Instant::now();
+                                    let windows =
+                                        run_world(&world, pool, lookahead, VIRTUAL_HORIZON);
+                                    let elapsed = t0.elapsed();
+                                    black_box(windows);
+                                    elapsed
+                                });
 
                                 // Teardown sanity (not timed): the ring was live.
-                                black_box(windows);
                                 assert!(
                                     total_received(&world) > 0,
                                     "no ring messages were delivered"
@@ -349,19 +487,23 @@ mod bench {
                                 .map(|id| build_island(id, false, Duration::ZERO))
                                 .collect();
 
-                            // The simulation: timed.
-                            let t0 = std::time::Instant::now();
-                            let windows = run_world(
-                                &world,
-                                1,
-                                Duration::from_millis(1),
-                                Duration::from_millis(100),
-                            );
-                            total += t0.elapsed();
+                            // Pool creation/teardown: NOT timed.
+                            total += with_worker_pool(&world, 1, |pool| {
+                                // The simulation: timed.
+                                let t0 = std::time::Instant::now();
+                                let windows = run_world(
+                                    &world,
+                                    pool,
+                                    Duration::from_millis(1),
+                                    Duration::from_millis(100),
+                                );
+                                let elapsed = t0.elapsed();
+                                black_box(windows);
+                                elapsed
+                            });
 
                             // Teardown sanity (not timed): pure overhead means the
                             // ring stayed silent.
-                            black_box(windows);
                             assert_eq!(total_received(&world), 0);
                             drop(world);
                         }
