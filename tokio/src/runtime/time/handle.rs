@@ -5,6 +5,12 @@ use std::fmt;
 pub(crate) struct Handle {
     pub(super) time_source: TimeSource,
     pub(super) inner: super::Inner,
+
+    /// Number of registered (uncollected) quiesce waiters. Lock-free fast path for
+    /// the current_thread scheduler's drain-park hook: when zero, the hook does
+    /// nothing beyond this single load.
+    #[cfg(feature = "test-util")]
+    pub(super) quiesce_waiter_count: crate::loom::sync::atomic::AtomicUsize,
 }
 
 impl Handle {

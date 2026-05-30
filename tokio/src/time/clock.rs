@@ -426,6 +426,14 @@ cfg_test_util! {
                 && inner.user_inhibit_count == 0
         }
 
+        /// Returns true if any `spawn_blocking` task spawned on this runtime is still
+        /// outstanding. Used by the quiesce drain-park hook: outstanding blocking work
+        /// implies future wakes, so the runtime is not quiescent.
+        pub(crate) fn has_blocking_inhibits(&self) -> bool {
+            let inner = self.inner.lock();
+            inner.blocking_inhibit_count > 0
+        }
+
         pub(crate) fn advance(&self, duration: Duration) -> Result<(), &'static str> {
             let mut inner = self.inner.lock();
 
