@@ -133,6 +133,35 @@ struct InnerState {
 
     /// Timer wheel.
     wheel: wheel::Wheel,
+
+    /// Registered quiesce waiters (test-util). Protected by the same mutex as the
+    /// wheel so the resolution decision (compare bounds against the wheel's next
+    /// expiration) is atomic.
+    #[cfg(feature = "test-util")]
+    quiesce_waiters: Vec<QuiesceWaiter>,
+
+    /// Monotonic id source for quiesce waiter registrations.
+    #[cfg(feature = "test-util")]
+    next_quiesce_waiter_id: u64,
+}
+
+cfg_test_util! {
+    /// A registered quiesce waiter: a task waiting for the runtime to become
+    /// quiescent at or below a virtual-time bound.
+    struct QuiesceWaiter {
+        /// Registration id (handed back to the `Quiesce` future).
+        id: u64,
+
+        /// Inclusive bound as a wheel tick (`deadline_to_tick`), or `None` for
+        /// an unbounded waiter (resolves only on an empty wheel).
+        bound: Option<u64>,
+
+        /// Waker of the waiting task (or root future).
+        waker: std::task::Waker,
+
+        /// Filled at resolution; collected by the future's next poll.
+        result: Option<crate::time::QuiescedState>,
+    }
 }
 
 // ===== impl Driver =====
@@ -151,12 +180,21 @@ impl Driver {
                 state: Mutex::new(InnerState {
                     next_wake: None,
                     wheel: wheel::Wheel::new(),
+
+                    #[cfg(feature = "test-util")]
+                    quiesce_waiters: Vec::new(),
+
+                    #[cfg(feature = "test-util")]
+                    next_quiesce_waiter_id: 0,
                 }),
                 is_shutdown: AtomicBool::new(false),
 
                 #[cfg(feature = "test-util")]
                 did_wake: AtomicBool::new(false),
             },
+
+            #[cfg(feature = "test-util")]
+            quiesce_waiter_count: crate::loom::sync::atomic::AtomicUsize::new(0),
         };
 
         let driver = Driver { park };
@@ -175,6 +213,9 @@ impl Driver {
                 #[cfg(feature = "test-util")]
                 did_wake: AtomicBool::new(false),
             },
+
+            #[cfg(feature = "test-util")]
+            quiesce_waiter_count: crate::loom::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -206,6 +247,17 @@ impl Driver {
         // Advance time forward to the end of time.
 
         handle.process_at_time(u64::MAX);
+
+        // Wake any registered quiesce waiters so they can observe the shutdown.
+        #[cfg(feature = "test-util")]
+        {
+            let mut lock = handle.inner.lock();
+            let waiters = std::mem::take(&mut lock.quiesce_waiters);
+            drop(lock);
+            for waiter in waiters {
+                waiter.waker.wake();
+            }
+        }
 
         self.park.shutdown(rt_handle);
     }
@@ -457,6 +509,147 @@ impl Handle {
                 #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
                 Inner::Alternative { did_wake, .. } => did_wake.swap(false, Ordering::SeqCst),
             }
+        }
+
+        /// Fast-path check for the scheduler's drain-park hook: are any quiesce
+        /// waiters registered?
+        ///
+        /// A single relaxed load; when this returns `false` the hook does nothing
+        /// else.
+        pub(crate) fn has_quiesce_waiters(&self) -> bool {
+            self.quiesce_waiter_count.load(Ordering::Relaxed) > 0
+        }
+
+        /// Registers a quiesce waiter with an optional inclusive bound (as an
+        /// `Instant`; converted to a wheel tick with the same round-up rule `Sleep`
+        /// uses). Returns the registration id.
+        // TODO: remove `allow(dead_code)` once the public `Quiesce` future calls this.
+        #[allow(dead_code)]
+        pub(crate) fn register_quiesce_waiter(
+            &self,
+            bound: Option<crate::time::Instant>,
+            waker: &std::task::Waker,
+        ) -> u64 {
+            let bound_tick = bound.map(|b| self.time_source.deadline_to_tick(b));
+
+            let mut lock = self.inner.lock();
+            let id = lock.next_quiesce_waiter_id;
+            lock.next_quiesce_waiter_id += 1;
+            lock.quiesce_waiters.push(QuiesceWaiter {
+                id,
+                bound: bound_tick,
+                waker: waker.clone(),
+                result: None,
+            });
+            // Increment under the lock so the scheduler's (lock-free) fast path can
+            // never observe count > 0 without the registry entry being visible once
+            // it takes the lock.
+            self.quiesce_waiter_count.fetch_add(1, Ordering::Relaxed);
+            drop(lock);
+
+            id
+        }
+
+        /// Polls a registered waiter: if it has resolved, removes it and returns the
+        /// report; otherwise refreshes its waker and returns `None`.
+        // TODO: remove `allow(dead_code)` once the public `Quiesce` future calls this.
+        #[allow(dead_code)]
+        pub(crate) fn poll_quiesce_waiter(
+            &self,
+            id: u64,
+            waker: &std::task::Waker,
+        ) -> Option<crate::time::QuiescedState> {
+            let mut lock = self.inner.lock();
+            let idx = lock
+                .quiesce_waiters
+                .iter()
+                .position(|w| w.id == id)
+                .expect("quiesce waiter missing from registry");
+
+            if lock.quiesce_waiters[idx].result.is_some() {
+                let waiter = lock.quiesce_waiters.swap_remove(idx);
+                self.quiesce_waiter_count.fetch_sub(1, Ordering::Relaxed);
+                drop(lock);
+                waiter.result
+            } else {
+                if !lock.quiesce_waiters[idx].waker.will_wake(waker) {
+                    lock.quiesce_waiters[idx].waker = waker.clone();
+                }
+                None
+            }
+        }
+
+        /// Removes a registered waiter (called when a `Quiesce` future is dropped
+        /// before collecting its result). Idempotent.
+        // TODO: remove `allow(dead_code)` once the public `Quiesce` future calls this.
+        #[allow(dead_code)]
+        pub(crate) fn deregister_quiesce_waiter(&self, id: u64) {
+            let mut lock = self.inner.lock();
+            if let Some(idx) = lock.quiesce_waiters.iter().position(|w| w.id == id) {
+                lock.quiesce_waiters.swap_remove(idx);
+                self.quiesce_waiter_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Resolution pass run by the current_thread scheduler's drain-park hook.
+        ///
+        /// Caller contract (enforced by the hook, not re-checked here): nothing is
+        /// runnable, no blocking task is outstanding, and a zero-timeout driver poll
+        /// has just completed (so all timers due at the current virtual time have
+        /// fired).
+        ///
+        /// Resolves every unresolved waiter whose bound is strictly below the wheel's
+        /// next expiration — or every waiter, if the wheel is empty. Returns true if
+        /// at least one waiter was resolved (the caller must then SKIP the park).
+        ///
+        /// Wakers are invoked only after the lock is dropped (the same lock-safety
+        /// rule `process_at_time` follows). Unlike `process_at_time`, this path is
+        /// cold (it fires at most a handful of times per stepping window, only with
+        /// `test-util`), so a plain `Vec` of wakers is used instead of the
+        /// fixed-capacity `WakeList` — this keeps the whole pass a single
+        /// lock-acquire / lock-release with no mid-loop relocking.
+        pub(crate) fn resolve_quiesce_waiters(&self, clock: &Clock) -> bool {
+            let mut lock = self.inner.lock();
+
+            let next_expiration = lock.wheel.next_expiration_time();
+            let now = clock.now();
+            let next_timer = next_expiration.map(|tick| self.time_source.tick_to_instant(tick));
+
+            let mut resolved_any = false;
+            let mut wakers: Vec<std::task::Waker> = Vec::new();
+
+            for waiter in lock.quiesce_waiters.iter_mut() {
+                if waiter.result.is_some() {
+                    // Already resolved on a previous cycle; awaiting collection.
+                    continue;
+                }
+
+                let resolves = match (waiter.bound, next_expiration) {
+                    // Empty wheel: every waiter (bounded or not) resolves.
+                    (_, None) => true,
+                    // Unbounded waiter, wheel non-empty: keep waiting.
+                    (None, Some(_)) => false,
+                    // Bounded waiter: resolves iff every pending timer lies strictly
+                    // beyond the bound.
+                    (Some(bound), Some(next)) => bound < next,
+                };
+
+                if resolves {
+                    waiter.result = Some(crate::time::QuiescedState { now, next_timer });
+                    wakers.push(waiter.waker.clone());
+                    resolved_any = true;
+                }
+            }
+
+            drop(lock);
+
+            // Wake outside the lock: a waker may run arbitrary code (task scheduling),
+            // and waking under the registry/wheel lock risks lock-order inversions.
+            for waker in wakers {
+                waker.wake();
+            }
+
+            resolved_any
         }
     }
 }

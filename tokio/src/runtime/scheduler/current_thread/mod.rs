@@ -392,7 +392,7 @@ impl Context {
             core.metrics.about_to_park();
             core.submit_metrics(handle);
 
-            core = self.park_internal(core, handle, &mut driver, None);
+            core = self.park_drain(core, handle, &mut driver);
 
             core.metrics.unparked();
             core.submit_metrics(handle);
@@ -417,6 +417,99 @@ impl Context {
 
         core.driver = Some(driver);
         core
+    }
+
+    /// Takes the drain-park: parks the thread until an event arrives.
+    ///
+    /// With `test-util`, registered `quiesce()` waiters are given a chance to resolve
+    /// first; if any resolve, the park is skipped (the resolved waiter is now
+    /// runnable work).
+    #[cfg(feature = "test-util")]
+    fn park_drain(&self, core: Box<Core>, handle: &Handle, driver: &mut Driver) -> Box<Core> {
+        let (core, resolved) = self.try_resolve_quiesce_waiters(core, handle, driver);
+
+        if resolved {
+            core
+        } else {
+            self.park_internal(core, handle, driver, None)
+        }
+    }
+
+    #[cfg(not(feature = "test-util"))]
+    fn park_drain(&self, core: Box<Core>, handle: &Handle, driver: &mut Driver) -> Box<Core> {
+        self.park_internal(core, handle, driver, None)
+    }
+
+    /// Quiesce resolution pass, run at the drain-park only.
+    ///
+    /// Preconditions (guaranteed by the caller): the run queue is empty, the deferred
+    /// list is empty, and the root future is not woken (`has_pending_work` returned
+    /// false).
+    ///
+    /// Inside a single scheduler `enter` scope (so that any task wakes triggered here
+    /// land on the run queue rather than being dropped as shutdown wakes):
+    ///
+    ///  1. Performs a zero-timeout driver poll. This surfaces IO readiness, fires
+    ///     timers already due at the current (paused, unmoved) virtual time, and lets
+    ///     raced cross-thread wakes land.
+    ///  2. Re-checks, using only state the scheduler and clock own, that nothing
+    ///     became runnable and no blocking task is outstanding. The time driver's
+    ///     `did_wake` flag is deliberately NOT read (and must not be consumed) here —
+    ///     it keeps its existing role as the auto-advance veto in the fall-through
+    ///     park.
+    ///  3. Resolves every waiter whose bound lies strictly below the wheel's next
+    ///     expiration (or all waiters if the wheel is empty), waking them.
+    ///
+    /// Returns `(core, true)` if at least one waiter resolved — the caller must then
+    /// skip the park; the clock is never advanced on a cycle that resolved a waiter.
+    #[cfg(feature = "test-util")]
+    fn try_resolve_quiesce_waiters(
+        &self,
+        core: Box<Core>,
+        handle: &Handle,
+        driver: &mut Driver,
+    ) -> (Box<Core>, bool) {
+        // Fast path: no waiter registered (and no time driver means no waiters can
+        // exist). One relaxed atomic load, no locks. (rt-quiesce.AC5.2)
+        let has_waiters = match &handle.driver.time {
+            Some(time_handle) => time_handle.has_quiesce_waiters(),
+            None => false,
+        };
+        if !has_waiters {
+            return (core, false);
+        }
+
+        // `self.enter` returns `(core, R)`; `R` is the closure's resolution result.
+        self.enter(core, || {
+            // (1) Zero-timeout driver poll. Tasks woken here (timer firings, IO
+            // readiness) are pushed onto the core inside the RefCell via the normal
+            // Schedule::schedule path.
+            driver.park_timeout(&handle.driver, Duration::from_millis(0));
+            self.defer.wake();
+
+            // (2) Runnable-work re-check. The core lives in the Context RefCell while
+            // inside `enter`.
+            let nothing_runnable = {
+                let core_ref = self.core.borrow();
+                let core_ref = core_ref.as_ref().expect("core missing");
+                core_ref.tasks.is_empty()
+            } && self.defer.is_empty()
+                && !handle.shared.woken.load(Acquire)
+                && handle.injection_queue_depth() == 0
+                && !handle.driver.clock.has_blocking_inhibits();
+
+            if !nothing_runnable {
+                return false;
+            }
+
+            // (3) Resolve eligible waiters. Their wakes happen inside this `enter`
+            // scope, so spawned-task waiters land on the run queue and the root-future
+            // waiter sets the `woken` flag.
+            match &handle.driver.time {
+                Some(time_handle) => time_handle.resolve_quiesce_waiters(&handle.driver.clock),
+                None => false,
+            }
+        })
     }
 
     fn has_pending_work(&self, core: &Core) -> bool {
