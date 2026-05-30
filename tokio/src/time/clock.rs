@@ -447,7 +447,7 @@ cfg_test_util! {
             #[cfg(feature = "rt-multi-thread")]
             scheduler::Handle::MultiThread(_) => panic!(
                 "`time::inhibit_auto_advance()` requires the `current_thread` Tokio runtime. \
-                 This is the default Runtime used by `#[tokio::test]."
+                 This is the default Runtime used by `#[tokio::test]`."
             ),
         }
 
@@ -484,7 +484,7 @@ cfg_test_util! {
 
             if !inner.enable_pausing {
                 return Err("`time::pause()` requires the `current_thread` Tokio runtime. \
-                        This is the default Runtime used by `#[tokio::test].");
+                        This is the default Runtime used by `#[tokio::test]`.");
             }
 
             // Track that we paused the clock

@@ -336,7 +336,7 @@ impl Quiesce {
             #[cfg(feature = "rt-multi-thread")]
             scheduler::Handle::MultiThread(_) => panic!(
                 "`time::quiesce()` requires the `current_thread` Tokio runtime. \
-                 This is the default Runtime used by `#[tokio::test]."
+                 This is the default Runtime used by `#[tokio::test]`."
             ),
         }
 
