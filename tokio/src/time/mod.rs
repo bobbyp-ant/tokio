@@ -90,7 +90,7 @@ cfg_test_util! {
     pub use clock::{advance, inhibit_auto_advance, pause, resume, AutoAdvanceGuard};
 
     mod quiesce;
-    pub use quiesce::QuiescedState;
+    pub use quiesce::{quiesce, quiesce_until, Quiesce, QuiescedState};
 }
 
 pub mod error;

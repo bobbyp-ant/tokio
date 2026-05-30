@@ -523,8 +523,6 @@ impl Handle {
         /// Registers a quiesce waiter with an optional inclusive bound (as an
         /// `Instant`; converted to a wheel tick with the same round-up rule `Sleep`
         /// uses). Returns the registration id.
-        // TODO: remove `allow(dead_code)` once the public `Quiesce` future calls this.
-        #[allow(dead_code)]
         pub(crate) fn register_quiesce_waiter(
             &self,
             bound: Option<crate::time::Instant>,
@@ -552,8 +550,6 @@ impl Handle {
 
         /// Polls a registered waiter: if it has resolved, removes it and returns the
         /// report; otherwise refreshes its waker and returns `None`.
-        // TODO: remove `allow(dead_code)` once the public `Quiesce` future calls this.
-        #[allow(dead_code)]
         pub(crate) fn poll_quiesce_waiter(
             &self,
             id: u64,
@@ -581,8 +577,6 @@ impl Handle {
 
         /// Removes a registered waiter (called when a `Quiesce` future is dropped
         /// before collecting its result). Idempotent.
-        // TODO: remove `allow(dead_code)` once the public `Quiesce` future calls this.
-        #[allow(dead_code)]
         pub(crate) fn deregister_quiesce_waiter(&self, id: u64) {
             let mut lock = self.inner.lock();
             if let Some(idx) = lock.quiesce_waiters.iter().position(|w| w.id == id) {
@@ -591,7 +585,7 @@ impl Handle {
             }
         }
 
-        /// Resolution pass run by the current_thread scheduler's drain-park hook.
+        /// Resolution pass run by the `current_thread` scheduler's drain-park hook.
         ///
         /// Caller contract (enforced by the hook, not re-checked here): nothing is
         /// runnable, no blocking task is outstanding, and a zero-timeout driver poll
@@ -607,7 +601,7 @@ impl Handle {
         /// cold (it fires at most a handful of times per stepping window, only with
         /// `test-util`), so a plain `Vec` of wakers is used instead of the
         /// fixed-capacity `WakeList` — this keeps the whole pass a single
-        /// lock-acquire / lock-release with no mid-loop relocking.
+        /// lock-acquire / lock-release with no mid-loop re-locking.
         pub(crate) fn resolve_quiesce_waiters(&self, clock: &Clock) -> bool {
             let mut lock = self.inner.lock();
 
