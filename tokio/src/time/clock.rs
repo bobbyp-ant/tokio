@@ -87,8 +87,12 @@ cfg_test_util! {
         /// Instant at which the clock was last unfrozen.
         unfrozen: Option<std::time::Instant>,
 
-        /// Number of `inhibit_auto_advance` calls still in effect.
-        auto_advance_inhibit_count: usize,
+        /// Number of `spawn_blocking` tasks still outstanding; each inhibits
+        /// auto-advance because a blocking task implies future work.
+        blocking_inhibit_count: usize,
+
+        /// Number of live `AutoAdvanceGuard`s; each inhibits auto-advance.
+        user_inhibit_count: usize,
     }
 
     /// Pauses time.
@@ -306,7 +310,8 @@ cfg_test_util! {
                     enable_pausing,
                     base: now,
                     unfrozen: Some(now),
-                    auto_advance_inhibit_count: 0,
+                    blocking_inhibit_count: 0,
+                    user_inhibit_count: 0,
                 }),
             };
 
@@ -340,20 +345,37 @@ cfg_test_util! {
             Ok(())
         }
 
-        /// Temporarily stop auto-advancing the clock (see `tokio::time::pause`).
-        pub(crate) fn inhibit_auto_advance(&self) {
+        /// Temporarily stop auto-advancing the clock (see `tokio::time::pause`)
+        /// on behalf of an outstanding blocking task.
+        pub(crate) fn inhibit_auto_advance_blocking(&self) {
             let mut inner = self.inner.lock();
-            inner.auto_advance_inhibit_count += 1;
+            inner.blocking_inhibit_count += 1;
         }
 
-        pub(crate) fn allow_auto_advance(&self) {
+        pub(crate) fn allow_auto_advance_blocking(&self) {
             let mut inner = self.inner.lock();
-            inner.auto_advance_inhibit_count -= 1;
+            inner.blocking_inhibit_count -= 1;
+        }
+
+        /// Temporarily stop auto-advancing the clock on behalf of a user-held
+        /// `AutoAdvanceGuard`.
+        #[allow(dead_code)]
+        pub(crate) fn inhibit_auto_advance_user(&self) {
+            let mut inner = self.inner.lock();
+            inner.user_inhibit_count += 1;
+        }
+
+        #[allow(dead_code)]
+        pub(crate) fn allow_auto_advance_user(&self) {
+            let mut inner = self.inner.lock();
+            inner.user_inhibit_count -= 1;
         }
 
         pub(crate) fn can_auto_advance(&self) -> bool {
             let inner = self.inner.lock();
-            inner.unfrozen.is_none() && inner.auto_advance_inhibit_count == 0
+            inner.unfrozen.is_none()
+                && inner.blocking_inhibit_count == 0
+                && inner.user_inhibit_count == 0
         }
 
         pub(crate) fn advance(&self, duration: Duration) -> Result<(), &'static str> {
