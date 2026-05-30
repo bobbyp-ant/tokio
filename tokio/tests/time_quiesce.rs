@@ -1021,3 +1021,98 @@ async fn quiesce_inside_local_set_run_until_exploratory() {
     assert_eq!(fired.load(SeqCst), 1);
     assert_eq!(state.now, start + Duration::from_millis(10));
 }
+
+// ===== Determinism (rt-quiesce.AC1.6) =====
+
+/// rt-quiesce.AC1.6: a windowed stepping loop with messages injected between windows
+/// produces identical `QuiescedState` reports and an identical application event log
+/// on every run with the same inputs.
+///
+/// The workload: a "server" task that receives messages and echoes a timestamped
+/// event after a per-message delay, plus a periodic "ticker". All timer durations
+/// derive deterministically from the message contents.
+#[cfg(feature = "test-util")]
+#[test]
+fn windowed_stepping_is_deterministic() {
+    // Reports and event logs use Durations relative to the runtime's own start so
+    // they are comparable across runs (absolute Instants differ between runtimes).
+    type Report = (Duration, Option<Duration>);
+    type EventLog = Vec<(Duration, String)>;
+
+    fn run_world() -> (Vec<Report>, EventLog) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let start = {
+            let _enter = rt.enter();
+            Instant::now()
+        };
+
+        let log: Arc<std::sync::Mutex<EventLog>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // Server: each received message schedules an echo event after a delay
+        // derived from the message length.
+        {
+            let log = log.clone();
+            let _enter = rt.enter();
+            rt.spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    let delay = Duration::from_millis(1 + (msg.len() as u64 % 5));
+                    time::sleep(delay).await;
+                    let now = Instant::now();
+                    log.lock()
+                        .unwrap()
+                        .push((now - start, format!("echo:{msg}")));
+                }
+            });
+        }
+
+        // Ticker: an event every 3ms for the first 30ms.
+        {
+            let log = log.clone();
+            let _enter = rt.enter();
+            rt.spawn(async move {
+                for i in 1..=10u64 {
+                    time::sleep_until(start + Duration::from_millis(i * 3)).await;
+                    let now = Instant::now();
+                    log.lock().unwrap().push((now - start, format!("tick:{i}")));
+                }
+            });
+        }
+
+        // Controller loop: 8 windows of 5ms; inject one message per window.
+        let mut reports = Vec::new();
+        let mut window_end = start;
+        for w in 0..8u64 {
+            // Inject an external message between windows.
+            tx.send(format!("msg-{w}")).unwrap();
+
+            window_end += Duration::from_millis(5);
+            let state = rt.block_on(time::quiesce_until(window_end));
+            reports.push((state.now - start, state.next_timer.map(|t| t - start)));
+        }
+        drop(tx);
+
+        let events = log.lock().unwrap().clone();
+        (reports, events)
+    }
+
+    let (reports_1, log_1) = run_world();
+    let (reports_2, log_2) = run_world();
+
+    assert_eq!(
+        reports_1, reports_2,
+        "QuiescedState report sequences differ between runs"
+    );
+    assert_eq!(log_1, log_2, "application event logs differ between runs");
+
+    // Sanity: the workload actually did something.
+    assert!(!log_1.is_empty());
+    assert!(log_1.iter().any(|(_, e)| e.starts_with("echo:")));
+    assert!(log_1.iter().any(|(_, e)| e.starts_with("tick:")));
+}
