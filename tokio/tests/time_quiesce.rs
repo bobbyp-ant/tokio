@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 
 use tokio::time::{self, Duration, Instant};
+use tokio_test::{assert_pending, task};
 
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
@@ -750,4 +751,74 @@ fn quiesce_resolves_despite_guard_when_no_timer_within_bound() {
     assert_eq!(state.next_timer, Some(start + Duration::from_millis(50)));
 
     drop(guard);
+}
+
+/// rt-quiesce.AC2.4: concurrent waiters resolve according to their own bounds. On a
+/// single drain-park, every waiter whose bound lies below the next expiration
+/// resolves, and the clock does not advance on a cycle that resolved waiters.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn multiple_waiters_resolve_per_their_bounds() {
+    let start = Instant::now();
+
+    // One timer at 50ms (within the wheel's bottom level => exact next_timer).
+    tokio::spawn(async move {
+        time::sleep_until(start + Duration::from_millis(50)).await;
+    });
+
+    // Three waiters: bounds at 10ms and 30ms (below the timer) and 100ms (above it).
+    let a =
+        tokio::spawn(async move { time::quiesce_until(start + Duration::from_millis(10)).await });
+    let b =
+        tokio::spawn(async move { time::quiesce_until(start + Duration::from_millis(30)).await });
+    let c =
+        tokio::spawn(async move { time::quiesce_until(start + Duration::from_millis(100)).await });
+
+    let (ra, rb, rc) = tokio::join!(a, b, c);
+    let (ra, rb, rc) = (ra.unwrap(), rb.unwrap(), rc.unwrap());
+
+    // A and B resolved with the clock untouched: their bounds are below the 50ms
+    // timer, and no advance happened on the resolving cycle.
+    assert_eq!(ra.now, start);
+    assert_eq!(rb.now, start);
+    assert_eq!(ra.next_timer, Some(start + Duration::from_millis(50)));
+    assert_eq!(rb.next_timer, Some(start + Duration::from_millis(50)));
+
+    // C resolved only after the 50ms timer fired.
+    assert_eq!(rc.now, start + Duration::from_millis(50));
+    assert_eq!(rc.next_timer, None);
+}
+
+/// rt-quiesce.AC2.7: dropping an unresolved `Quiesce` deregisters its waiter, and
+/// subsequent auto-advance behavior is unchanged.
+///
+/// Deregistration is observed two ways: (1) `advance()` works again (it panics while
+/// any waiter is registered), and (2) ordinary auto-advance still fires timers.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+async fn dropping_unresolved_quiesce_deregisters() {
+    let start = Instant::now();
+
+    // A pending timer that keeps the wheel non-empty (so the waiter cannot resolve).
+    tokio::spawn(async move {
+        time::sleep_until(start + Duration::from_millis(100)).await;
+    });
+    // Make sure the spawned task has registered its timer.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+
+    {
+        // Manually poll a quiesce future so it registers, then drop it unresolved.
+        let mut quiesce = task::spawn(time::quiesce_until(start + Duration::from_millis(200)));
+        assert_pending!(quiesce.poll());
+    } // <- dropped here; the waiter must be deregistered
+
+    // (1) If a waiter were still registered, this would panic
+    //     ("cannot be called while a `quiesce()` is in progress").
+    time::advance(Duration::from_millis(1)).await;
+
+    // (2) Normal auto-advance still works: the 100ms timer fires by sleeping to it.
+    time::sleep_until(start + Duration::from_millis(100)).await;
+    assert_eq!(Instant::now(), start + Duration::from_millis(100));
 }
