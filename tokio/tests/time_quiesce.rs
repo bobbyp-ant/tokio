@@ -595,3 +595,159 @@ async fn resume_during_quiesce_panics() {
 
     time::resume();
 }
+
+// ===== Interaction semantics (rt-quiesce.AC2) =====
+
+/// rt-quiesce.AC2.1: an outstanding `spawn_blocking` task defers quiesce resolution;
+/// the step returns only after the blocking task completed AND the async task
+/// awaiting it has been polled (its completion processed).
+///
+/// Complements `quiesce_waits_for_outstanding_blocking_task` (unbounded quiesce
+/// observing the blocking closure's own side effect): this test uses a bounded step
+/// and observes the completion processing of an async task awaiting the blocking
+/// task's `JoinHandle`, plus that the clock never moves.
+#[cfg(feature = "test-util")]
+#[test]
+fn quiesce_until_processes_blocking_task_completion() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let start = {
+        let _enter = rt.enter();
+        Instant::now()
+    };
+
+    let completion_processed = Arc::new(AtomicUsize::new(0));
+    {
+        let completion_processed = completion_processed.clone();
+        let _enter = rt.enter();
+        rt.spawn(async move {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(100));
+            })
+            .await
+            .unwrap();
+            // This line is "the completion has been processed".
+            completion_processed.fetch_add(1, SeqCst);
+        });
+    }
+
+    let wall_start = std::time::Instant::now();
+    let state = rt.block_on(time::quiesce_until(start + Duration::from_millis(10)));
+    let elapsed = wall_start.elapsed();
+
+    // The step waited for the blocking task (~100ms wall time) and the awaiting
+    // task ran to completion before resolution.
+    assert_eq!(completion_processed.load(SeqCst), 1);
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "elapsed: {elapsed:?}"
+    );
+    // No timer was involved; the clock did not move.
+    assert_eq!(state.now, start);
+    assert_eq!(state.next_timer, None);
+}
+
+/// rt-quiesce.AC2.2: a held `AutoAdvanceGuard` with a timer at-or-below the bound
+/// makes the step wait in real time; dropping the guard from another thread lets the
+/// in-progress step complete (timer fires, work runs, then resolution) without
+/// restarting it.
+#[cfg(feature = "test-util")]
+#[test]
+fn quiesce_waits_for_guard_when_timer_within_bound() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let start = {
+        let _enter = rt.enter();
+        Instant::now()
+    };
+
+    let guard = {
+        let _enter = rt.enter();
+        time::inhibit_auto_advance()
+    };
+
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        let _enter = rt.enter();
+        rt.spawn(async move {
+            time::sleep_until(start + Duration::from_millis(5)).await;
+            fired.fetch_add(1, SeqCst);
+        });
+    }
+
+    let wall_start = std::time::Instant::now();
+    let th = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(guard);
+    });
+
+    // Timer at 5ms <= bound 10ms: cannot resolve while the guard blocks auto-advance.
+    let state = rt.block_on(time::quiesce_until(start + Duration::from_millis(10)));
+    let elapsed = wall_start.elapsed();
+
+    // The guard was honored: the step did not complete before the drop...
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "elapsed: {elapsed:?}"
+    );
+    // ...and the drop completed the in-progress step promptly.
+    assert!(elapsed < Duration::from_secs(10), "elapsed: {elapsed:?}");
+    // The timer fired (after the guard dropped) and its work ran before resolution.
+    assert_eq!(fired.load(SeqCst), 1);
+    assert_eq!(state.now, start + Duration::from_millis(5));
+    assert_eq!(state.next_timer, None);
+    th.join().unwrap();
+}
+
+/// rt-quiesce.AC2.3: a held guard does NOT prevent resolution when no timer at or
+/// below the bound is pending (the guard only blocks auto-advance, not quiescence).
+#[cfg(feature = "test-util")]
+#[test]
+fn quiesce_resolves_despite_guard_when_no_timer_within_bound() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let start = {
+        let _enter = rt.enter();
+        Instant::now()
+    };
+
+    // Hold a guard for the entire test (dropped at the end, same thread).
+    let guard = {
+        let _enter = rt.enter();
+        time::inhibit_auto_advance()
+    };
+
+    // A timer strictly BEYOND the bound. 50ms keeps its deadline within the wheel's
+    // bottom level (within 64ms of `now`), so the reported next_timer is exact.
+    {
+        let _enter = rt.enter();
+        rt.spawn(async move {
+            time::sleep_until(start + Duration::from_millis(50)).await;
+        });
+    }
+
+    let wall_start = std::time::Instant::now();
+    let state = rt.block_on(time::quiesce_until(start + Duration::from_millis(10)));
+    let elapsed = wall_start.elapsed();
+
+    // Resolved promptly in real time (no waiting for the guard).
+    assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+    assert_eq!(state.now, start);
+    // The 50ms timer is still pending and within the bottom wheel level => exact.
+    assert_eq!(state.next_timer, Some(start + Duration::from_millis(50)));
+
+    drop(guard);
+}
