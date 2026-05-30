@@ -455,21 +455,6 @@ async fn quiesce_cross_thread_wake_during_step() {
     blocking.await.unwrap();
 }
 
-#[cfg(feature = "test-util")]
-#[tokio::test]
-#[should_panic(expected = "requires the runtime's clock to be paused")]
-async fn quiesce_unpaused_clock_panics() {
-    // Clock not paused (no start_paused, no time::pause()).
-    let _ = time::quiesce().await;
-}
-
-#[cfg(feature = "test-util")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[should_panic(expected = "requires the `current_thread` Tokio runtime")]
-async fn quiesce_multi_thread_panics() {
-    let _ = time::quiesce().await;
-}
-
 /// A `Quiesce` future first-polled from a thread that only holds a `Handle::enter`
 /// guard must wake the target runtime: registration unparks the runtime's driver so
 /// a parked runtime re-runs its drain-park hook and notices the new waiter. Without
@@ -516,6 +501,114 @@ fn quiesce_from_enter_guard_thread_wakes_parked_runtime() {
     rt_thread.join().unwrap();
 }
 
+// ===== Misuse panics (rt-quiesce.AC3) =====
+//
+// AC3.3's inhibit_auto_advance()-outside-runtime case is covered in
+// tests/time_pause.rs (inhibit_auto_advance_outside_runtime_panics).
+
+/// rt-quiesce.AC3.1: awaiting `Quiesce` on a multi-thread runtime panics with a
+/// message naming the current_thread requirement.
+#[cfg(feature = "test-util")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[should_panic(expected = "requires the `current_thread` Tokio runtime")]
+async fn quiesce_multi_thread_panics() {
+    let _ = time::quiesce().await;
+}
+
+/// rt-quiesce.AC3.2: awaiting `Quiesce` on a runtime whose clock is not paused
+/// panics with a message naming the paused-clock requirement.
+#[cfg(feature = "test-util")]
+#[tokio::test]
+#[should_panic(expected = "requires the runtime's clock to be paused")]
+async fn quiesce_unpaused_clock_panics() {
+    // Clock not paused (no start_paused, no time::pause()).
+    let _ = time::quiesce().await;
+}
+
+/// rt-quiesce.AC3.3: polling `Quiesce` outside any runtime context panics with the
+/// standard tokio context-missing message.
+#[cfg(feature = "test-util")]
+#[test]
+#[should_panic(expected = "must be called from the context of a Tokio 1.x runtime")]
+fn quiesce_poll_outside_runtime_panics() {
+    // Construction is lazy and does NOT panic...
+    let mut quiesce = task::spawn(time::quiesce());
+    // ...polling outside a runtime does.
+    let _ = quiesce.poll();
+}
+
+/// rt-quiesce.AC3.4: awaiting `Quiesce` on a runtime built without a time driver
+/// panics with the standard timers-disabled message.
+#[cfg(feature = "test-util")]
+#[test]
+#[should_panic(expected = "timers are disabled")]
+fn quiesce_without_time_driver_panics() {
+    // No enable_time(): the runtime has a clock but no time driver.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        // Pause the clock first (works without a time driver) so the failure is
+        // unambiguously about the missing driver, not the unpaused clock.
+        time::pause();
+        time::quiesce().await
+    });
+}
+
+/// rt-quiesce.AC3.5: `resume()` while any quiesce waiter is registered panics
+/// (stepping and a running wall clock are mutually exclusive).
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "cannot be called while a `quiesce()` is in progress")]
+async fn resume_during_quiesce_panics() {
+    let start = Instant::now();
+
+    // A spawned task holds an unbounded quiesce open (never resolves: the timer
+    // below keeps the wheel non-empty).
+    tokio::spawn(async {
+        let _ = time::quiesce().await;
+    });
+    // A pending timer so the quiesce waiter cannot resolve.
+    tokio::spawn(async move {
+        time::sleep_until(start + Duration::from_millis(100)).await;
+    });
+
+    // Let the spawned tasks run (and the waiter register) by yielding a few times.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    time::resume();
+}
+
+/// rt-quiesce.AC3.6: `advance()` while any quiesce waiter is registered panics: an
+/// explicit advance would move the clock past the step's bound and break
+/// reproducibility.
+#[cfg(feature = "test-util")]
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "cannot be called while a `quiesce()` is in progress")]
+async fn advance_during_quiesce_panics() {
+    let start = Instant::now();
+
+    // A spawned task holds an unbounded quiesce open (never resolves: the timer
+    // below keeps the wheel non-empty).
+    tokio::spawn(async {
+        let _ = time::quiesce().await;
+    });
+    // A pending timer so the quiesce waiter cannot resolve.
+    tokio::spawn(async move {
+        time::sleep_until(start + Duration::from_millis(100)).await;
+    });
+
+    // Let the spawned tasks run (and the waiter register) by yielding a few times.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    time::advance(Duration::from_millis(10)).await;
+}
+
 /// A `Quiesce` future that outlives its runtime panics with the standard
 /// runtime-shutdown message when polled, not an internal registry error. The driver
 /// drains the waiter registry at shutdown, so the waiter is gone by the time this
@@ -549,52 +642,6 @@ fn quiesce_polled_after_shutdown_panics() {
     // The orphaned future must report the shutdown when polled again.
     let mut cx = Context::from_waker(noop_waker_ref());
     let _ = quiesce.as_mut().poll(&mut cx);
-}
-
-/// `advance()` while a quiesce step is registered panics: an explicit advance would
-/// move the clock past the step's bound and break reproducibility.
-#[cfg(feature = "test-util")]
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "cannot be called while a `quiesce()` is in progress")]
-async fn advance_during_quiesce_panics() {
-    let start = Instant::now();
-
-    // A spawned task holds an unbounded quiesce open (never resolves: the timer
-    // below keeps the wheel non-empty).
-    tokio::spawn(async {
-        let _ = time::quiesce().await;
-    });
-    // A pending timer so the quiesce waiter cannot resolve.
-    tokio::spawn(async move {
-        time::sleep_until(start + Duration::from_millis(100)).await;
-    });
-
-    // Let the spawned tasks run (and the waiter register) by yielding a few times.
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-
-    time::advance(Duration::from_millis(10)).await;
-}
-
-#[cfg(feature = "test-util")]
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "cannot be called while a `quiesce()` is in progress")]
-async fn resume_during_quiesce_panics() {
-    let start = Instant::now();
-
-    tokio::spawn(async {
-        let _ = time::quiesce().await;
-    });
-    tokio::spawn(async move {
-        time::sleep_until(start + Duration::from_millis(100)).await;
-    });
-
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-
-    time::resume();
 }
 
 // ===== Interaction semantics (rt-quiesce.AC2) =====
