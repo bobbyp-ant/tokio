@@ -162,6 +162,20 @@ cfg_test_util! {
         /// Filled at resolution; collected by the future's next poll.
         result: Option<crate::time::QuiescedState>,
     }
+
+    /// Outcome of polling a registered quiesce waiter.
+    pub(crate) enum QuiescePoll {
+        /// The waiter resolved; it has been removed from the registry.
+        Ready(crate::time::QuiescedState),
+
+        /// The waiter is registered but has not yet resolved.
+        Pending,
+
+        /// The waiter is no longer in the registry. The registry is only ever
+        /// drained wholesale by `Driver::shutdown`, so this means the driver shut
+        /// down after the waiter registered.
+        Missing,
+    }
 }
 
 // ===== impl Driver =====
@@ -549,29 +563,34 @@ impl Handle {
         }
 
         /// Polls a registered waiter: if it has resolved, removes it and returns the
-        /// report; otherwise refreshes its waker and returns `None`.
+        /// report; otherwise refreshes its waker.
+        ///
+        /// Returns [`QuiescePoll::Missing`] if the waiter is not in the registry,
+        /// which happens when the driver shut down (and drained the registry)
+        /// concurrently with this poll. The caller decides how to surface that.
         pub(crate) fn poll_quiesce_waiter(
             &self,
             id: u64,
             waker: &std::task::Waker,
-        ) -> Option<crate::time::QuiescedState> {
+        ) -> QuiescePoll {
             let mut lock = self.inner.lock();
-            let idx = lock
-                .quiesce_waiters
-                .iter()
-                .position(|w| w.id == id)
-                .expect("quiesce waiter missing from registry");
+            let idx = match lock.quiesce_waiters.iter().position(|w| w.id == id) {
+                Some(idx) => idx,
+                None => return QuiescePoll::Missing,
+            };
 
-            if lock.quiesce_waiters[idx].result.is_some() {
-                let waiter = lock.quiesce_waiters.swap_remove(idx);
-                self.quiesce_waiter_count.fetch_sub(1, Ordering::Relaxed);
-                drop(lock);
-                waiter.result
-            } else {
-                if !lock.quiesce_waiters[idx].waker.will_wake(waker) {
-                    lock.quiesce_waiters[idx].waker = waker.clone();
+            match lock.quiesce_waiters[idx].result {
+                Some(result) => {
+                    lock.quiesce_waiters.swap_remove(idx);
+                    self.quiesce_waiter_count.fetch_sub(1, Ordering::Relaxed);
+                    QuiescePoll::Ready(result)
                 }
-                None
+                None => {
+                    if !lock.quiesce_waiters[idx].waker.will_wake(waker) {
+                        lock.quiesce_waiters[idx].waker = waker.clone();
+                    }
+                    QuiescePoll::Pending
+                }
             }
         }
 

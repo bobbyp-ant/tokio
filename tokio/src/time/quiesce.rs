@@ -5,6 +5,7 @@
 // (Module-level docs are completed along with the public quiesce API.)
 
 use crate::runtime::scheduler;
+use crate::runtime::time::QuiescePoll;
 use crate::time::Instant;
 
 use pin_project_lite::pin_project;
@@ -220,11 +221,18 @@ impl Future for Quiesce {
                 }
 
                 match time_handle.poll_quiesce_waiter(*id, cx.waker()) {
-                    Some(report) => {
+                    QuiescePoll::Ready(report) => {
                         *this.state = State::Done;
                         Poll::Ready(report)
                     }
-                    None => Poll::Pending,
+                    QuiescePoll::Pending => Poll::Pending,
+                    QuiescePoll::Missing => {
+                        // The registry is only drained wholesale by the driver's
+                        // shutdown, which sets the shutdown flag first; the shutdown
+                        // raced with the `is_shutdown` check above.
+                        debug_assert!(time_handle.is_shutdown());
+                        panic!("{}", crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR);
+                    }
                 }
             }
             State::Done => panic!("`Quiesce` polled after completion"),
