@@ -469,6 +469,41 @@ async fn quiesce_multi_thread_panics() {
     let _ = time::quiesce().await;
 }
 
+/// A `Quiesce` future that outlives its runtime panics with the standard
+/// runtime-shutdown message when polled, not an internal registry error. The driver
+/// drains the waiter registry at shutdown, so the waiter is gone by the time this
+/// poll runs.
+#[cfg(feature = "test-util")]
+#[test]
+#[should_panic(expected = "A Tokio 1.x context was found, but it is being shutdown.")]
+fn quiesce_polled_after_shutdown_panics() {
+    use futures::task::noop_waker_ref;
+    use std::future::Future;
+    use std::task::Context;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let mut quiesce = Box::pin(time::quiesce());
+
+    // First poll registers the waiter with the runtime's time driver.
+    {
+        let _enter = rt.enter();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(quiesce.as_mut().poll(&mut cx).is_pending());
+    }
+
+    // Shutting the runtime down drains the waiter registry.
+    drop(rt);
+
+    // The orphaned future must report the shutdown when polled again.
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let _ = quiesce.as_mut().poll(&mut cx);
+}
+
 /// `advance()` while a quiesce step is registered panics: an explicit advance would
 /// move the clock past the step's bound and break reproducibility.
 #[cfg(feature = "test-util")]
