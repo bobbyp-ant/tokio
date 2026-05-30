@@ -469,6 +469,52 @@ async fn quiesce_multi_thread_panics() {
     let _ = time::quiesce().await;
 }
 
+/// A `Quiesce` future first-polled from a thread that only holds a `Handle::enter`
+/// guard must wake the target runtime: registration unparks the runtime's driver so
+/// a parked runtime re-runs its drain-park hook and notices the new waiter. Without
+/// the unpark, the waiter would only resolve when the runtime woke for some other
+/// reason.
+#[cfg(feature = "test-util")]
+#[test]
+fn quiesce_from_enter_guard_thread_wakes_parked_runtime() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+
+    let handle = rt.handle().clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (root_tx, root_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Park the runtime on its own thread, blocked on a future that resolves only
+    // after the quiesce below completes.
+    let rt_thread = std::thread::spawn(move || {
+        rt.block_on(async move {
+            ready_tx.send(()).unwrap();
+            root_rx.await.unwrap();
+        });
+    });
+
+    // Wait for the runtime to start, then give it time to reach its park. (If it has
+    // not parked yet, the test still passes -- the hook sees the waiter on the way to
+    // the park -- it just does not exercise the interesting interleaving.)
+    ready_rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // From this thread, holding only an enter guard, an unbounded quiesce must
+    // resolve: nothing else will wake the parked runtime.
+    {
+        let _enter = handle.enter();
+        let state = futures::executor::block_on(time::quiesce());
+        assert!(state.next_timer.is_none());
+    }
+
+    // Unblock the root future and shut down cleanly.
+    root_tx.send(()).unwrap();
+    rt_thread.join().unwrap();
+}
+
 /// A `Quiesce` future that outlives its runtime panics with the standard
 /// runtime-shutdown message when polled, not an internal registry error. The driver
 /// drains the waiter registry at shutdown, so the waiter is gone by the time this

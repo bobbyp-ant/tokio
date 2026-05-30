@@ -537,6 +537,11 @@ impl Handle {
         /// Registers a quiesce waiter with an optional inclusive bound (as an
         /// `Instant`; converted to a wheel tick with the same round-up rule `Sleep`
         /// uses). Returns the registration id.
+        ///
+        /// The caller is responsible for unparking the target runtime's driver
+        /// afterwards so a parked runtime notices the new waiter; this handle alone
+        /// cannot do that (it can only set the time driver's `did_wake` flag, not
+        /// wake the runtime thread).
         pub(crate) fn register_quiesce_waiter(
             &self,
             bound: Option<crate::time::Instant>,

@@ -196,6 +196,15 @@ impl Quiesce {
         }
 
         let id = time_handle.register_quiesce_waiter(bound, waker);
+
+        // This poll may be running on a thread that merely holds a `Handle::enter`
+        // guard while the target runtime is parked on its own thread. Nothing else
+        // would cause a parked runtime to re-run its drain-park hook and notice the
+        // new waiter, so unpark its driver explicitly. (The full driver unpark is
+        // needed -- the time handle alone only sets `did_wake` and cannot wake the
+        // runtime thread.)
+        handle.driver().unpark();
+
         (id, handle.clone())
     }
 }
