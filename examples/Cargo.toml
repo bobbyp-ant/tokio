@@ -8,7 +8,7 @@ license = "MIT"
 # If you copy one of the examples into a new project, you should be using
 # [dependencies] instead, and delete the **path**.
 [dev-dependencies]
-tokio = { version = "1.0.0", path = "../tokio", features = ["full", "tracing"] }
+tokio = { version = "1.0.0", path = "../tokio", features = ["full", "test-util", "tracing"] }
 tokio-util = { version = "0.7.0", path = "../tokio-util", features = ["full"] }
 tokio-stream = { version = "0.1", path = "../tokio-stream" }
 
@@ -28,7 +28,7 @@ once_cell = "1.5.2"
 libc = "0.2"
 
 [target.'cfg(all(tokio_unstable, target_os = "linux"))'.dev-dependencies]
-tokio = { version = "1.0.0", path = "../tokio", features = ["full", "tracing", "taskdump"] }
+tokio = { version = "1.0.0", path = "../tokio", features = ["full", "test-util", "tracing", "taskdump"] }
 
 [target.'cfg(windows)'.dev-dependencies.windows-sys]
 version = "0.61"
@@ -112,6 +112,10 @@ path = "dump.rs"
 [[example]]
 name = "prewarm-fd-table"
 path = "prewarm-fd-table.rs"
+
+[[example]]
+name = "sim-islands"
+path = "sim-islands.rs"
 
 [lints]
 workspace = true
