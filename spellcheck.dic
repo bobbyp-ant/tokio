@@ -1,4 +1,4 @@
-324
+329
 &
 +
 <
@@ -101,6 +101,7 @@ destructor
 destructors
 destructure
 Destructures
+deterministically
 Dev
 dns
 DNS
@@ -213,6 +214,8 @@ poller
 POSIX
 proxied
 qos
+quiesce
+quiesced
 RAII
 RCU
 reallocations
@@ -224,11 +227,13 @@ refcounting
 repo
 repr
 representable
+reproducibility
 reqwest
 reregistering
 resize
 resized
 RMW
+runnable
 runtime
 runtime's
 runtimes

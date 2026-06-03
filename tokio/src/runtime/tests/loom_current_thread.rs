@@ -230,3 +230,309 @@ fn auto_advance_guard_drop_vs_park() {
         th.join().unwrap();
     });
 }
+
+#[test]
+fn quiesce_vs_cross_thread_schedule() {
+    use crate::runtime::tests::loom_oneshot;
+
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+
+        let (tx, rx) = loom_oneshot::channel();
+
+        // Remote thread: spawns a task onto the runtime (inject queue + unpark),
+        // racing with the drain-park's resolution decision below.
+        let th = loom::thread::spawn(move || {
+            handle.spawn(async move {
+                tx.send(());
+            });
+        });
+
+        // Step 1: races with the remote spawn. May resolve before or after the
+        // injected task lands; either is correct.
+        let _ = rt.block_on(crate::time::quiesce());
+
+        // After join, the spawn has definitely been pushed.
+        th.join().unwrap();
+
+        // Step 2: the injected task (if it has not already run) must run before this
+        // unbounded quiesce resolves: the scheduler drains the inject queue before
+        // parking, and the drain-park hook re-checks it before resolving waiters.
+        let _ = rt.block_on(crate::time::quiesce());
+
+        // Proves the task ran in some step (was never dropped/lost). If the runtime
+        // lost the cross-thread spawn entirely, this recv never completes and loom
+        // reports a deadlock.
+        let () = rx.recv();
+    });
+}
+
+#[test]
+fn quiesce_guard_drop_vs_park() {
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (guard, bound) = {
+            let _enter = rt.handle().enter();
+            let guard = crate::time::inhibit_auto_advance();
+            let bound = crate::time::Instant::now() + Duration::from_millis(1);
+            (guard, bound)
+        };
+
+        // A timer exactly at the bound: the step can only complete after the guard
+        // drops (auto-advance is needed to fire it).
+        {
+            let _enter = rt.handle().enter();
+            rt.handle().spawn(async {
+                crate::time::sleep(Duration::from_millis(1)).await;
+            });
+        }
+
+        // Guard dropped from another thread, racing the runtime's park.
+        let th = loom::thread::spawn(move || {
+            drop(guard);
+        });
+
+        // Must complete under every interleaving (a missed unpark or a resolution
+        // that ignores the pending timer shows up as a loom deadlock or a panic).
+        let state = rt.block_on(crate::time::quiesce_until(bound));
+
+        // The timer fired before resolution.
+        assert!(state.next_timer.is_none());
+
+        th.join().unwrap();
+    });
+}
+
+#[test]
+fn quiesce_both_waiter_shapes() {
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        // A held guard gates both waiters' resolution on a cross-thread event: the
+        // 1ms timer below can only fire via auto-advance, which the guard blocks.
+        let (guard, bound) = {
+            let _enter = rt.handle().enter();
+            let guard = crate::time::inhibit_auto_advance();
+            let bound = crate::time::Instant::now() + Duration::from_millis(2);
+            (guard, bound)
+        };
+
+        // A timer at 1ms (inside both bounds).
+        {
+            let _enter = rt.handle().enter();
+            rt.handle().spawn(async {
+                crate::time::sleep(Duration::from_millis(1)).await;
+            });
+        }
+
+        // Spawned-task waiter.
+        let waiter_jh = {
+            let _enter = rt.handle().enter();
+            rt.handle()
+                .spawn(async move { crate::time::quiesce_until(bound).await })
+        };
+
+        // The guard drop (inhibit release + unpark) races, from another thread,
+        // with the runtime registering the waiters, parking, and auto-advancing.
+        let th = loom::thread::spawn(move || {
+            drop(guard);
+        });
+
+        // Root-future waiter: block_on the spawned waiter's JoinHandle; the root
+        // future itself then awaits a quiesce as well. Neither shape can resolve
+        // before the guard is dropped (a missed release/unpark shows up as a loom
+        // deadlock).
+        let spawned_report = rt.block_on(waiter_jh).unwrap();
+        let root_report = rt.block_on(crate::time::quiesce_until(bound));
+
+        // Both shapes saw the timer fire and the same final clock position.
+        assert_eq!(spawned_report.now, root_report.now);
+        assert!(spawned_report.next_timer.is_none());
+        assert!(root_report.next_timer.is_none());
+
+        th.join().unwrap();
+    });
+}
+
+/// Asserts that a caught panic payload carries the standard runtime-shutting-down
+/// message (and not, for example, a tripped `debug_assert`).
+fn assert_runtime_shutting_down_panic(payload: Box<dyn std::any::Any + Send>) {
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    assert!(
+        msg.contains(crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR),
+        "unexpected panic message: {msg}"
+    );
+}
+
+/// Races runtime shutdown against polling a registered `Quiesce` waiter from
+/// another thread.
+///
+/// Verifies the cross-thread ordering claim behind `QuiescePoll::Missing`: the
+/// registry is only drained wholesale by driver shutdown, which stores the
+/// shutdown flag (`SeqCst`) before taking the registry lock to drain it, so a poll
+/// that finds its waiter missing must also observe `is_shutdown() == true` (the
+/// `debug_assert` in `Quiesce::poll`'s `Missing` arm). The poll panicking with
+/// the standard runtime-shutting-down message is the expected outcome whenever
+/// it observes the shutdown; tripping the `debug_assert` is the bug this model
+/// exists to catch.
+#[test]
+fn quiesce_poll_vs_shutdown() {
+    use futures::task::noop_waker_ref;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        // Register a waiter. A noop waker suffices: this model never relies on the
+        // wake being delivered, only on the poll outcomes below.
+        let mut quiesce = Box::pin(crate::time::quiesce());
+        {
+            let _enter = rt.handle().enter();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(quiesce.as_mut().poll(&mut cx).is_pending());
+        }
+
+        // Shut the runtime down from another thread, racing the poll below.
+        let th = loom::thread::spawn(move || {
+            drop(rt);
+        });
+
+        // The poll either runs before the shutdown becomes observable (Pending) or
+        // observes it and panics with RUNTIME_SHUTTING_DOWN_ERROR. It can never
+        // resolve (the waiter registry is only resolved at a drain park, which the
+        // shutdown path does not reach), and it must never panic with anything
+        // else -- in particular not the `debug_assert` in the `Missing` arm.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut cx = Context::from_waker(noop_waker_ref());
+            quiesce.as_mut().poll(&mut cx)
+        }));
+
+        match result {
+            Ok(Poll::Pending) => {}
+            Ok(Poll::Ready(_)) => panic!("quiesce waiter resolved during shutdown"),
+            Err(payload) => assert_runtime_shutting_down_panic(payload),
+        }
+
+        th.join().unwrap();
+    });
+}
+
+/// Races runtime shutdown against the FIRST poll (registration) of a `Quiesce`
+/// future from another thread.
+///
+/// Registration checks the shutdown flag under the waiter-registry lock, and
+/// driver shutdown stores that flag (`SeqCst`) before taking the same lock to
+/// drain the registry. Exactly two outcomes are therefore possible:
+///
+/// - registration observes the shutdown and the first poll panics with the
+///   standard runtime-shutting-down message, or
+/// - registration lands before the drain; the drain then removes the waiter and
+///   wakes it, and the next poll panics with that same message.
+///
+/// What must never happen: a `Pending` first poll whose waiter is never woken (an
+/// awaiting caller would hang forever), a waiter that resolves with a report, or a
+/// tripped `debug_assert` in `Quiesce::poll`'s `Missing` arm.
+#[test]
+fn quiesce_first_poll_vs_shutdown() {
+    use futures::task::ArcWake;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Counts wake calls. Uses std (not loom) types throughout: `ArcWake` requires a
+    // `std::sync::Arc`, and the count is only read after `th.join()`, whose
+    // happens-before edge makes the value well defined without loom tracking it.
+    struct CountingWaker {
+        wakes: AtomicUsize,
+    }
+
+    impl ArcWake for CountingWaker {
+        fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+            arc_self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    loom::model(|| {
+        let rt = Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+
+        // Shut the runtime down from another thread, racing the first poll below.
+        let th = loom::thread::spawn(move || {
+            drop(rt);
+        });
+
+        let counting_waker = std::sync::Arc::new(CountingWaker {
+            wakes: AtomicUsize::new(0),
+        });
+        let waker = futures::task::waker(counting_waker.clone());
+
+        let mut quiesce = Box::pin(crate::time::quiesce());
+
+        // First poll: the registration races the shutdown.
+        let first = catch_unwind(AssertUnwindSafe(|| {
+            let _enter = handle.enter();
+            let mut cx = Context::from_waker(&waker);
+            quiesce.as_mut().poll(&mut cx)
+        }));
+
+        // After this join the shutdown -- including its registry drain -- is
+        // complete.
+        th.join().unwrap();
+
+        match first {
+            // Registration observed the shutdown and was refused.
+            Err(payload) => assert_runtime_shutting_down_panic(payload),
+
+            // Registration landed before the drain.
+            Ok(Poll::Pending) => {
+                // The drain woke the waiter; without this wake an awaiting caller
+                // would never be polled again and would hang forever.
+                assert!(
+                    counting_waker.wakes.load(Ordering::SeqCst) > 0,
+                    "waiter registered on a shutting-down driver was never woken"
+                );
+
+                // The next poll surfaces the shutdown; `Pending` (the hang), a
+                // resolved report, and the `Missing`-arm `debug_assert` are all
+                // bugs.
+                let second = catch_unwind(AssertUnwindSafe(|| {
+                    let mut cx = Context::from_waker(&waker);
+                    quiesce.as_mut().poll(&mut cx)
+                }));
+                match second {
+                    Err(payload) => assert_runtime_shutting_down_panic(payload),
+                    Ok(poll) => {
+                        panic!("poll after shutdown returned {poll:?} instead of panicking")
+                    }
+                }
+            }
+
+            Ok(Poll::Ready(_)) => panic!("quiesce waiter resolved during shutdown"),
+        }
+    });
+}

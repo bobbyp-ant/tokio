@@ -49,6 +49,25 @@ cfg_test_util! {
                 Err(msg) => panic!("{}", msg),
             }
         }
+
+        /// Panics if any quiesce waiter is registered on the current runtime's time
+        /// driver. `resume()` and `advance()` are mutually exclusive with an
+        /// in-progress `quiesce()` step: both would move the clock out from under the
+        /// step and break its reproducibility contract.
+        #[track_caller]
+        fn panic_if_quiesce_waiters(api: &str) {
+            use crate::runtime::Handle;
+
+            if let Ok(handle) = Handle::try_current() {
+                if let Some(time_handle) = handle.inner.driver().time.as_ref() {
+                    if time_handle.has_quiesce_waiters() {
+                        panic!(
+                            "`time::{api}()` cannot be called while a `quiesce()` is in progress"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     cfg_not_rt! {
@@ -129,7 +148,8 @@ cfg_test_util! {
     /// current time when awaited.
     ///
     /// Auto-advance can be held off entirely by holding an [`AutoAdvanceGuard`]
-    /// (see [`inhibit_auto_advance`]).
+    /// (see [`inhibit_auto_advance`]), and a paused runtime can be stepped
+    /// through virtual time deterministically with [`quiesce_until`].
     ///
     /// # Preventing auto-advance
     ///
@@ -168,6 +188,7 @@ cfg_test_util! {
     /// [`Sleep`]: crate::time::Sleep
     /// [`advance`]: crate::time::advance
     /// [`spawn_blocking`]: crate::task::spawn_blocking
+    /// [`quiesce_until`]: crate::time::quiesce_until
     #[track_caller]
     pub fn pause() {
         with_clock(|maybe_clock| {
@@ -185,10 +206,14 @@ cfg_test_util! {
     ///
     /// # Panics
     ///
-    /// Panics if time is not frozen or if called from outside of the Tokio
-    /// runtime.
+    /// Panics if time is not frozen, if called from outside of the Tokio
+    /// runtime, or if a [`quiesce`] step is in progress on this runtime
+    /// (quiescence stepping and a running wall clock are mutually exclusive).
+    ///
+    /// [`quiesce`]: crate::time::quiesce()
     #[track_caller]
     pub fn resume() {
+        panic_if_quiesce_waiters("resume");
         with_clock(|maybe_clock| {
             let clock = match maybe_clock {
                 Some(clock) => clock,
@@ -265,6 +290,9 @@ cfg_test_util! {
     /// - If called outside of the Tokio runtime.
     /// - If the input `duration` is too large (such as [`Duration::MAX`])
     ///   to be safely added to the current time without causing an overflow.
+    /// - If a [`quiesce`] step is in progress on this runtime. The two APIs are
+    ///   mutually exclusive: an explicit advance during a step would move the
+    ///   clock past the step's bound.
     ///
     /// # Caveats
     ///
@@ -278,7 +306,9 @@ cfg_test_util! {
     /// details.
     ///
     /// [`sleep`]: fn@crate::time::sleep
+    /// [`quiesce`]: crate::time::quiesce()
     pub async fn advance(duration: Duration) {
+        panic_if_quiesce_waiters("advance");
         with_clock(|maybe_clock| {
             let clock = match maybe_clock {
                 Some(clock) => clock,
@@ -317,15 +347,21 @@ cfg_test_util! {
     /// The guard always affects the runtime it was created on, regardless of which
     /// runtime context (if any) is current when it is dropped.
     ///
+    /// A held guard blocks auto-advance, not quiescence: it does not prevent
+    /// [`quiesce_until`] from resolving when no timer at or below that call's
+    /// bound is pending.
+    ///
     /// # Caution
     ///
     /// Holding a guard on the same thread that then blocks the runtime on a future
     /// that can only complete via auto-advance (for example, a `sleep` on a paused
-    /// runtime with no other pending work) waits in real time until the guard is
-    /// dropped from another thread. Hold and drop guards from outside the runtime,
-    /// or from tasks that are woken by external events.
+    /// runtime with no other pending work, or a [`quiesce_until`] with a timer at
+    /// or below its bound) waits in real time until the guard is dropped from
+    /// another thread. Hold and drop guards from outside the runtime, or from tasks
+    /// that are woken by external events.
     ///
     /// [`spawn_blocking`]: crate::task::spawn_blocking
+    /// [`quiesce_until`]: crate::time::quiesce_until
     #[derive(Debug)]
     #[must_use = "auto-advance is re-enabled when the guard is dropped"]
     pub struct AutoAdvanceGuard {
@@ -493,6 +529,20 @@ cfg_test_util! {
             inner.unfrozen.is_none()
                 && inner.blocking_inhibit_count == 0
                 && inner.user_inhibit_count == 0
+        }
+
+        /// Returns true if any `spawn_blocking` task spawned on this runtime is still
+        /// outstanding. Used by the quiesce drain-park hook: outstanding blocking work
+        /// implies future wakes, so the runtime is not quiescent.
+        pub(crate) fn has_blocking_inhibits(&self) -> bool {
+            let inner = self.inner.lock();
+            inner.blocking_inhibit_count > 0
+        }
+
+        /// Returns true if the clock is currently paused (frozen).
+        pub(crate) fn is_paused(&self) -> bool {
+            let inner = self.inner.lock();
+            inner.unfrozen.is_none()
         }
 
         pub(crate) fn advance(&self, duration: Duration) -> Result<(), &'static str> {
